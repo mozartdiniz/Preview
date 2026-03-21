@@ -15,6 +15,11 @@ pub struct TextAnnotation {
     pub font_desc: pango::FontDescription,
     /// RGBA components in 0.0 – 1.0.
     pub color: (f64, f64, f64, f64),
+    /// Rotation in radians, clockwise.
+    pub rotation: f64,
+    /// Rotation pivot offset from (x, y) in image-pixel coordinates.
+    pub pivot_dx: f64,
+    pub pivot_dy: f64,
 }
 
 /// Draw a single annotation onto the given Cairo context.
@@ -24,8 +29,13 @@ pub fn draw_text_annotation(cr: &cairo::Context, ann: &TextAnnotation) {
     layout.set_font_description(Some(&ann.font_desc));
     layout.set_text(&ann.text);
     cr.set_source_rgba(ann.color.0, ann.color.1, ann.color.2, ann.color.3);
-    cr.move_to(ann.x, ann.y);
+    cr.save().unwrap();
+    // Translate to pivot point, rotate, then draw text offset from pivot
+    cr.translate(ann.x + ann.pivot_dx, ann.y + ann.pivot_dy);
+    cr.rotate(ann.rotation);
+    cr.move_to(-ann.pivot_dx, -ann.pivot_dy);
     pangocairo::functions::show_layout(cr, &layout);
+    cr.restore().unwrap();
 }
 
 /// Flatten all annotations onto `img`, returning a new `DynamicImage`.

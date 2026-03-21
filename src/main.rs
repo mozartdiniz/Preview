@@ -37,12 +37,21 @@ struct State {
     text_tool_active: bool,
     text_font_desc: Option<gtk4::pango::FontDescription>,
     text_color: (f64, f64, f64, f64),
+    text_rotation: f64,  // radians
     // Draft annotation being typed (image-space coords)
     draft_pos: Option<(f64, f64)>,
     draft_text: String,
     // Selected annotation index (for drag-to-move)
     selected_ann: Option<usize>,
     move_origin: Option<(f64, f64)>,  // annotation's image coords at drag start
+    // Rotation drag
+    rotation_drag: bool,
+    rotation_drag_anchor: (f64, f64),    // pivot in widget space
+    rotation_drag_begin: (f64, f64),     // widget pos where drag started
+    rotation_drag_initial_rotation: f64,
+    // Pivot drag
+    pivot_drag: bool,
+    pivot_drag_origin: (f64, f64),       // (pivot_dx, pivot_dy) at drag start
 }
 
 impl State {
@@ -174,6 +183,15 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         .build();
     text_hint.add_css_class("dim-label");
 
+    // Rotation spin button (degrees)
+    let rotation_adj = gtk4::Adjustment::new(0.0, -180.0, 180.0, 1.0, 15.0, 0.0);
+    let rotation_spin = gtk4::SpinButton::new(Some(&rotation_adj), 1.0, 0);
+    rotation_spin.set_wrap(true);
+    rotation_spin.set_tooltip_text(Some("Rotation (°)"));
+    rotation_spin.set_width_chars(5);
+
+    let rotation_label = gtk4::Label::new(Some("°"));
+
     let text_tool_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     text_tool_bar.set_visible(false);
     text_tool_bar.set_margin_start(12);
@@ -184,6 +202,8 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
     text_tool_bar.append(&text_hint);
     text_tool_bar.append(&font_btn);
     text_tool_bar.append(&color_btn);
+    text_tool_bar.append(&rotation_spin);
+    text_tool_bar.append(&rotation_label);
 
     // ── Header bar ────────────────────────────────────────────────────────────
     let open_btn = gtk4::Button::builder()
@@ -355,17 +375,43 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
                     layout.set_text(&ann.text);
                     let (_, ext) = layout.pixel_extents();
                     let pad = 4.0 / scale;
+                    let handle_r = 5.0 / scale;
+                    cr.save().unwrap();
+                    // Pivot-centred rotated space (same transform as draw_text_annotation)
+                    cr.translate(ann.x + ann.pivot_dx, ann.y + ann.pivot_dy);
+                    cr.rotate(ann.rotation);
+                    // Bounding box in pivot-local space
+                    let bx = ext.x() as f64 - ann.pivot_dx - pad;
+                    let by = ext.y() as f64 - ann.pivot_dy - pad;
+                    let bw = ext.width() as f64 + pad * 2.0;
+                    let bh = ext.height() as f64 + pad * 2.0;
+                    // Dashed bounding box
                     cr.set_source_rgba(0.2, 0.6, 1.0, 0.9);
                     cr.set_line_width(1.5 / scale);
                     cr.set_dash(&[5.0 / scale, 4.0 / scale], 0.0);
-                    cr.rectangle(
-                        ann.x + ext.x() as f64 - pad,
-                        ann.y + ext.y() as f64 - pad,
-                        ext.width() as f64 + pad * 2.0,
-                        ext.height() as f64 + pad * 2.0,
-                    );
+                    cr.rectangle(bx, by, bw, bh);
                     cr.stroke().unwrap();
                     cr.set_dash(&[], 0.0);
+                    // Corner rotation handles
+                    for (cx, cy) in [(bx, by), (bx + bw, by), (bx, by + bh), (bx + bw, by + bh)] {
+                        cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+                        cr.arc(cx, cy, handle_r, 0.0, std::f64::consts::TAU);
+                        cr.fill().unwrap();
+                        cr.set_source_rgba(0.2, 0.6, 1.0, 0.9);
+                        cr.set_line_width(1.5 / scale);
+                        cr.arc(cx, cy, handle_r, 0.0, std::f64::consts::TAU);
+                        cr.stroke().unwrap();
+                    }
+                    // Pivot handle at origin (the pivot point itself)
+                    let pr = handle_r * 1.4;
+                    let ch = handle_r * 2.5;
+                    cr.set_source_rgba(1.0, 0.8, 0.0, 1.0);
+                    cr.set_line_width(1.5 / scale);
+                    cr.arc(0.0, 0.0, pr, 0.0, std::f64::consts::TAU);
+                    cr.stroke().unwrap();
+                    cr.move_to(-ch, 0.0); cr.line_to(ch, 0.0); cr.stroke().unwrap();
+                    cr.move_to(0.0, -ch); cr.line_to(0.0, ch); cr.stroke().unwrap();
+                    cr.restore().unwrap();
                 }
             }
             // Draw draft annotation (live preview while typing)
@@ -380,6 +426,9 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
                             .clone()
                             .unwrap_or_else(|| gtk4::pango::FontDescription::from_string("Sans 24")),
                         color: s.text_color,
+                        rotation: s.text_rotation,
+                        pivot_dx: 0.0,
+                        pivot_dy: 0.0,
                     };
                     image_ops::draw_text_annotation(cr, &preview);
                 }
@@ -723,12 +772,16 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
                         .clone()
                         .unwrap_or_else(|| gtk4::pango::FontDescription::from_string("Sans 24"));
                     let color = s.text_color;
+                    let rotation = s.text_rotation;
                     s.annotations.push(image_ops::TextAnnotation {
                         x: dx,
                         y: dy,
                         text,
                         font_desc,
                         color,
+                        rotation,
+                        pivot_dx: 0.0,
+                        pivot_dy: 0.0,
                     });
                 }
             } else {
@@ -772,6 +825,7 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         let set_text_mode = set_text_mode.clone();
         let font_btn = font_btn.clone();
         let color_btn = color_btn.clone();
+        let rotation_spin = rotation_spin.clone();
         move |g, n, x, y| {
             let (active, has_image, fit_mode, img_w, img_h) = {
                 let s = state.borrow();
@@ -845,10 +899,10 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
                     });
                 } else {
                     // Single click → select for dragging, sync toolbar to annotation's style
-                    let (ann_font, ann_color) = {
+                    let (ann_font, ann_color, ann_rotation) = {
                         let s = state.borrow();
                         let ann = &s.annotations[idx];
-                        (ann.font_desc.clone(), ann.color)
+                        (ann.font_desc.clone(), ann.color, ann.rotation)
                     };
                     state.borrow_mut().selected_ann = Some(idx);
                     font_btn.set_font_desc(&ann_font);
@@ -858,6 +912,7 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
                         ann_color.2 as f32,
                         ann_color.3 as f32,
                     ));
+                    rotation_spin.set_value(ann_rotation.to_degrees());
                 }
                 canvas.queue_draw();
                 return;
@@ -871,7 +926,9 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
                 s.draft_pos = Some((img_x, img_y));
                 s.draft_text.clear();
                 s.selected_ann = None;
+                s.text_rotation = 0.0;
             }
+            rotation_spin.set_value(0.0);
             draft_entry.set_text("");
             // Defer popup for the same Wayland reason
             let xi = x as i32;
@@ -896,9 +953,8 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         let state = state.clone();
         let canvas = canvas.clone();
         move |g, x, y| {
-            // Extract everything we need then release the borrow before set_state,
-            // because set_state can synchronously fire drag_end which borrows state.
-            let (active, fit_mode, img_w, img_h, zoom, hit) = {
+            enum DragMode { Pivot, Rotate, Move }
+            let (active, drag_mode, hit) = {
                 let s = state.borrow();
                 let vw = canvas.width() as f64;
                 let vh = canvas.height() as f64;
@@ -907,19 +963,53 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
                 } else {
                     (0.0, 0.0, s.zoom)
                 };
-                let hit = hit_test_annotation(&s.annotations, x, y, ox, oy, scale)
-                    .map(|idx| (idx, s.annotations[idx].x, s.annotations[idx].y));
-                (s.text_tool_active, s.fit_mode, s.img_width, s.img_height, s.zoom, hit)
+                // Priority: pivot handle > rotation corner > body move
+                let (mode, hit) = if let Some(idx) = s.selected_ann {
+                    let ann = &s.annotations[idx];
+                    if hit_test_pivot_handle(ann, x, y, ox, oy, scale) {
+                        (DragMode::Pivot, Some((idx, ann.x, ann.y,
+                            ox + (ann.x + ann.pivot_dx) * scale,
+                            oy + (ann.y + ann.pivot_dy) * scale,
+                            ann.rotation, ann.pivot_dx, ann.pivot_dy)))
+                    } else if hit_test_rotation_handle(ann, x, y, ox, oy, scale) {
+                        (DragMode::Rotate, Some((idx, ann.x, ann.y,
+                            ox + (ann.x + ann.pivot_dx) * scale,
+                            oy + (ann.y + ann.pivot_dy) * scale,
+                            ann.rotation, ann.pivot_dx, ann.pivot_dy)))
+                    } else {
+                        let h = hit_test_annotation(&s.annotations, x, y, ox, oy, scale)
+                            .map(|i| (i, s.annotations[i].x, s.annotations[i].y, 0.0, 0.0, 0.0, 0.0, 0.0));
+                        (DragMode::Move, h)
+                    }
+                } else {
+                    let h = hit_test_annotation(&s.annotations, x, y, ox, oy, scale)
+                        .map(|i| (i, s.annotations[i].x, s.annotations[i].y, 0.0, 0.0, 0.0, 0.0, 0.0));
+                    (DragMode::Move, h)
+                };
+                (s.text_tool_active, mode, hit)
             };
-            let _ = (fit_mode, img_w, img_h, zoom); // suppress unused warnings
             if !active {
                 g.set_state(gtk4::EventSequenceState::Denied);
                 return;
             }
-            if let Some((idx, orig_x, orig_y)) = hit {
+            if let Some((idx, orig_x, orig_y, pivot_wx, pivot_wy, init_rot, init_pdx, init_pdy)) = hit {
                 let mut s = state.borrow_mut();
                 s.selected_ann = Some(idx);
-                s.move_origin = Some((orig_x, orig_y));
+                match drag_mode {
+                    DragMode::Pivot => {
+                        s.pivot_drag = true;
+                        s.pivot_drag_origin = (init_pdx, init_pdy);
+                    }
+                    DragMode::Rotate => {
+                        s.rotation_drag = true;
+                        s.rotation_drag_anchor = (pivot_wx, pivot_wy);
+                        s.rotation_drag_begin = (x, y);
+                        s.rotation_drag_initial_rotation = init_rot;
+                    }
+                    DragMode::Move => {
+                        s.move_origin = Some((orig_x, orig_y));
+                    }
+                }
                 drop(s);
                 canvas.queue_draw();
             } else {
@@ -930,6 +1020,7 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
     text_drag.connect_drag_update({
         let state = state.clone();
         let canvas = canvas.clone();
+        let rotation_spin = rotation_spin.clone();
         move |_g, dx, dy| {
             let s = state.borrow();
             if !s.text_tool_active { return; }
@@ -937,7 +1028,38 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
                 image_ops::fit_transform(s.img_width, s.img_height,
                     canvas.width() as f64, canvas.height() as f64)
             } else { (0.0, 0.0, s.zoom) };
-            if let (Some(idx), Some((ox, oy))) = (s.selected_ann, s.move_origin) {
+            if s.pivot_drag {
+                if let Some(idx) = s.selected_ann {
+                    let (opx, opy) = s.pivot_drag_origin;
+                    let new_pdx = opx + dx / scale;
+                    let new_pdy = opy + dy / scale;
+                    drop(s);
+                    let mut s = state.borrow_mut();
+                    s.annotations[idx].pivot_dx = new_pdx;
+                    s.annotations[idx].pivot_dy = new_pdy;
+                    drop(s);
+                    canvas.queue_draw();
+                }
+            } else if s.rotation_drag {
+                if let Some(idx) = s.selected_ann {
+                    let (ax, ay) = s.rotation_drag_anchor;
+                    let (bx, by) = s.rotation_drag_begin;
+                    let init_rot = s.rotation_drag_initial_rotation;
+                    // Angles from anchor to begin and to current position
+                    let angle_begin = (by - ay).atan2(bx - ax);
+                    let cur_x = bx + dx;
+                    let cur_y = by + dy;
+                    let angle_cur = (cur_y - ay).atan2(cur_x - ax);
+                    let new_rot = init_rot + (angle_cur - angle_begin);
+                    drop(s);
+                    let mut s = state.borrow_mut();
+                    s.annotations[idx].rotation = new_rot;
+                    s.text_rotation = new_rot;
+                    drop(s);
+                    rotation_spin.set_value(new_rot.to_degrees());
+                    canvas.queue_draw();
+                }
+            } else if let (Some(idx), Some((ox, oy))) = (s.selected_ann, s.move_origin) {
                 let nx = ox + dx / scale;
                 let ny = oy + dy / scale;
                 drop(s);
@@ -952,7 +1074,10 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
     text_drag.connect_drag_end({
         let state = state.clone();
         move |_, _, _| {
-            state.borrow_mut().move_origin = None;
+            let mut s = state.borrow_mut();
+            s.move_origin = None;
+            s.rotation_drag = false;
+            s.pivot_drag = false;
         }
     });
     canvas.add_controller(text_drag);
@@ -1223,6 +1348,23 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
             if let Some(idx) = s.selected_ann {
                 if let Some(ann) = s.annotations.get_mut(idx) {
                     ann.color = color;
+                }
+                drop(s);
+                canvas.queue_draw();
+            }
+        }
+    });
+
+    rotation_spin.connect_value_changed({
+        let state = state.clone();
+        let canvas = canvas.clone();
+        move |spin| {
+            let rad = spin.value().to_radians();
+            let mut s = state.borrow_mut();
+            s.text_rotation = rad;
+            if let Some(idx) = s.selected_ann {
+                if let Some(ann) = s.annotations.get_mut(idx) {
+                    ann.rotation = rad;
                 }
                 drop(s);
                 canvas.queue_draw();
@@ -1737,22 +1879,82 @@ fn hit_test_annotation(
 ) -> Option<usize> {
     // Iterate in reverse so the last-drawn (topmost) annotation wins
     for (i, ann) in annotations.iter().enumerate().rev() {
-        let sx = ox + ann.x * scale;
-        let sy = oy + ann.y * scale;
-        // Approximate text height in screen pixels from the font size stored in the descriptor
+        // Transform to pivot-centred rotated local space (mirrors draw_text_annotation)
+        let px = ox + (ann.x + ann.pivot_dx) * scale;
+        let py = oy + (ann.y + ann.pivot_dy) * scale;
+        let dx = (wx - px) / scale;
+        let dy = (wy - py) / scale;
+        let cos_r = ann.rotation.cos();
+        let sin_r = ann.rotation.sin();
+        let lx = dx * cos_r + dy * sin_r;
+        let ly = -dx * sin_r + dy * cos_r;
+        // Text bounds in pivot-local space: anchor at (-pivot_dx, -pivot_dy)
         let font_pt = ann.font_desc.size() as f64 / gtk4::pango::SCALE as f64;
-        let approx_h = (font_pt * scale * 1.4).max(20.0);
-        // Approximate width: very rough, but generous enough for a usable hit area
-        let approx_w = (ann.text.len() as f64 * font_pt * scale * 0.7).max(30.0);
-        if wx >= sx - 4.0
-            && wx <= sx + approx_w + 4.0
-            && wy >= sy - 4.0
-            && wy <= sy + approx_h + 4.0
+        let approx_h = (font_pt * scale * 1.4).max(20.0) / scale;
+        let approx_w = (ann.text.len() as f64 * font_pt * scale * 0.7).max(30.0) / scale;
+        let pad = 4.0 / scale;
+        let bx = -ann.pivot_dx - pad;
+        let by = -ann.pivot_dy - pad;
+        if lx >= bx
+            && lx <= bx + approx_w + pad * 2.0
+            && ly >= by
+            && ly <= by + approx_h + pad * 2.0
         {
             return Some(i);
         }
     }
     None
+}
+
+/// Returns true if (wx, wy) is on the pivot handle of `ann`.
+fn hit_test_pivot_handle(
+    ann: &image_ops::TextAnnotation,
+    wx: f64,
+    wy: f64,
+    ox: f64,
+    oy: f64,
+    scale: f64,
+) -> bool {
+    // Pivot is at (ann.x + pivot_dx, ann.y + pivot_dy) in image space — it doesn't rotate
+    let px = ox + (ann.x + ann.pivot_dx) * scale;
+    let py = oy + (ann.y + ann.pivot_dy) * scale;
+    ((wx - px).powi(2) + (wy - py).powi(2)).sqrt() <= 10.0
+}
+
+/// Returns true if (wx, wy) is on a corner rotation handle of `ann`.
+fn hit_test_rotation_handle(
+    ann: &image_ops::TextAnnotation,
+    wx: f64,
+    wy: f64,
+    ox: f64,
+    oy: f64,
+    scale: f64,
+) -> bool {
+    // Transform to pivot-centred rotated local space
+    let px = ox + (ann.x + ann.pivot_dx) * scale;
+    let py = oy + (ann.y + ann.pivot_dy) * scale;
+    let dx = (wx - px) / scale;
+    let dy = (wy - py) / scale;
+    let cos_r = ann.rotation.cos();
+    let sin_r = ann.rotation.sin();
+    let lx = dx * cos_r + dy * sin_r;
+    let ly = -dx * sin_r + dy * cos_r;
+    // Corner positions in pivot-local space
+    let font_pt = ann.font_desc.size() as f64 / gtk4::pango::SCALE as f64;
+    let approx_h = (font_pt * scale * 1.4).max(20.0) / scale;
+    let approx_w = (ann.text.len() as f64 * font_pt * scale * 0.7).max(30.0) / scale;
+    let pad = 4.0 / scale;
+    let hit_r = 10.0 / scale;
+    let bx = -ann.pivot_dx - pad;
+    let by = -ann.pivot_dy - pad;
+    let bw = approx_w + pad * 2.0;
+    let bh = approx_h + pad * 2.0;
+    for (cx, cy) in [(bx, by), (bx + bw, by), (bx, by + bh), (bx + bw, by + bh)] {
+        if ((lx - cx).powi(2) + (ly - cy).powi(2)).sqrt() <= hit_r {
+            return true;
+        }
+    }
+    false
 }
 
 fn linked_box(buttons: &[&gtk4::Widget]) -> gtk4::Box {
