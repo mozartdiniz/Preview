@@ -1,20 +1,37 @@
+mod image_ops;
+
+use gtk4::cairo;
 use gtk4::prelude::*;
 use gtk4::{gdk, gio, glib};
+use image::DynamicImage;
 use libadwaita as adw;
-use std::cell::RefCell;
+use libadwaita::prelude::*;
+use std::cell::{Cell, RefCell};
 use std::env;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 const APP_ID: &str = "com.example.Preview";
 
-// ── App state ────────────────────────────────────────────────────────────────
+// ── State ─────────────────────────────────────────────────────────────────────
 
 #[derive(Default)]
 struct State {
+    // Zoom / display
     zoom: f64,
+    fit_mode: bool,
     img_width: i32,
     img_height: i32,
-    fit_mode: bool,
+    // Cairo surface used by the draw func (derived from `image`)
+    surface: Option<cairo::ImageSurface>,
+    // Editable pixel data (None for display-only formats like SVG)
+    image: Option<DynamicImage>,
+    // Original file path (for Save overwrite)
+    file_path: Option<PathBuf>,
+    // Crop rubber-band in widget (viewport) coordinates — fit-mode only
+    in_crop: bool,
+    drag_start: Option<(f64, f64)>,
+    drag_end: Option<(f64, f64)>,
 }
 
 impl State {
@@ -25,7 +42,6 @@ impl State {
             ..Default::default()
         }
     }
-
     fn has_image(&self) -> bool {
         self.img_width > 0
     }
@@ -49,28 +65,28 @@ fn main() -> glib::ExitCode {
     app.run_with_args(&env::args().collect::<Vec<_>>())
 }
 
-// ── UI construction ───────────────────────────────────────────────────────────
+// ── UI ────────────────────────────────────────────────────────────────────────
 
 fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
     let state = Rc::new(RefCell::new(State::new()));
 
-    // ── Image display ────────────────────────────────────────────────────────
-    let picture = gtk4::Picture::new();
-    picture.set_can_shrink(true);
-    picture.set_content_fit(gtk4::ContentFit::Contain);
-    picture.set_hexpand(true);
-    picture.set_vexpand(true);
-
-    // Checkerboard-ish background so transparency is visible
-    picture.add_css_class("image-view");
+    // ── Canvas (DrawingArea replaces Picture + Overlay) ───────────────────────
+    //
+    // set_content_width/height controls the natural size used by the ScrolledWindow
+    // for scroll-bar decisions. In zoom mode we set it to img*zoom; in fit mode
+    // we set it to 0 and let the widget expand to fill the viewport.
+    let canvas = gtk4::DrawingArea::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .build();
 
     let scrolled = gtk4::ScrolledWindow::builder()
         .hexpand(true)
         .vexpand(true)
         .build();
-    scrolled.set_child(Some(&picture));
+    scrolled.set_child(Some(&canvas));
 
-    // ── Status bar ───────────────────────────────────────────────────────────
+    // ── Status bar ────────────────────────────────────────────────────────────
     let status_label = gtk4::Label::builder()
         .label("Open an image to get started")
         .margin_start(12)
@@ -90,54 +106,140 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         .build();
     zoom_label.add_css_class("dim-label");
 
-    // ── Header bar buttons ───────────────────────────────────────────────────
+    let status_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    status_box.append(&status_label);
+    status_box.append(&zoom_label);
+
+    // ── Crop controls bar ─────────────────────────────────────────────────────
+    let cancel_crop_btn = gtk4::Button::with_label("Cancel");
+    let apply_crop_btn = gtk4::Button::builder()
+        .label("Apply Crop")
+        .sensitive(false)
+        .build();
+    apply_crop_btn.add_css_class("suggested-action");
+
+    let crop_hint = gtk4::Label::builder()
+        .label("Drag to select the crop area")
+        .hexpand(true)
+        .halign(gtk4::Align::Center)
+        .build();
+    crop_hint.add_css_class("dim-label");
+
+    let crop_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    crop_bar.set_visible(false);
+    crop_bar.set_margin_start(12);
+    crop_bar.set_margin_end(12);
+    crop_bar.set_margin_top(6);
+    crop_bar.set_margin_bottom(6);
+    crop_bar.append(&cancel_crop_btn);
+    crop_bar.append(&crop_hint);
+    crop_bar.append(&apply_crop_btn);
+
+    // ── Header bar ────────────────────────────────────────────────────────────
     let open_btn = gtk4::Button::builder()
         .icon_name("document-open-symbolic")
         .tooltip_text("Open Image (Ctrl+O)")
         .build();
 
+    // Zoom group
     let zoom_out_btn = gtk4::Button::builder()
         .icon_name("zoom-out-symbolic")
         .tooltip_text("Zoom Out  (–)")
         .sensitive(false)
         .build();
-
     let zoom_fit_btn = gtk4::Button::builder()
         .icon_name("zoom-fit-best-symbolic")
         .tooltip_text("Fit to Window  (3)")
         .sensitive(false)
         .build();
-
     let zoom_orig_btn = gtk4::Button::builder()
         .icon_name("zoom-original-symbolic")
         .tooltip_text("Actual Size  (1)")
         .sensitive(false)
         .build();
-
     let zoom_in_btn = gtk4::Button::builder()
         .icon_name("zoom-in-symbolic")
         .tooltip_text("Zoom In  (+)")
         .sensitive(false)
         .build();
+    let zoom_group = linked_box(&[
+        zoom_out_btn.upcast_ref(),
+        zoom_fit_btn.upcast_ref(),
+        zoom_orig_btn.upcast_ref(),
+        zoom_in_btn.upcast_ref(),
+    ]);
 
-    let zoom_group = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    zoom_group.add_css_class("linked");
-    zoom_group.append(&zoom_out_btn);
-    zoom_group.append(&zoom_fit_btn);
-    zoom_group.append(&zoom_orig_btn);
-    zoom_group.append(&zoom_in_btn);
+    // Edit group
+    let resize_btn = gtk4::Button::builder()
+        .label("Resize")
+        .tooltip_text("Change dimensions")
+        .sensitive(false)
+        .build();
+    let rotate_ccw_btn = gtk4::Button::builder()
+        .icon_name("object-rotate-left-symbolic")
+        .tooltip_text("Rotate 90° Left")
+        .sensitive(false)
+        .build();
+    let rotate_cw_btn = gtk4::Button::builder()
+        .icon_name("object-rotate-right-symbolic")
+        .tooltip_text("Rotate 90° Right")
+        .sensitive(false)
+        .build();
+    let flip_h_btn = gtk4::Button::builder()
+        .icon_name("object-flip-horizontal-symbolic")
+        .tooltip_text("Flip Horizontal")
+        .sensitive(false)
+        .build();
+    let flip_v_btn = gtk4::Button::builder()
+        .icon_name("object-flip-vertical-symbolic")
+        .tooltip_text("Flip Vertical")
+        .sensitive(false)
+        .build();
+    let crop_btn = gtk4::Button::builder()
+        .icon_name("transform-crop-symbolic")
+        .tooltip_text("Crop Image")
+        .sensitive(false)
+        .build();
+    let edit_group = linked_box(&[
+        resize_btn.upcast_ref(),
+        rotate_ccw_btn.upcast_ref(),
+        rotate_cw_btn.upcast_ref(),
+        flip_h_btn.upcast_ref(),
+        flip_v_btn.upcast_ref(),
+        crop_btn.upcast_ref(),
+    ]);
+
+    // Save menu button
+    let save_menu = {
+        let m = gio::Menu::new();
+        let file_sec = gio::Menu::new();
+        file_sec.append(Some("Save"), Some("win.save"));
+        file_sec.append(Some("Save As…"), Some("win.save-as"));
+        m.append_section(None, &file_sec);
+        let exp_sec = gio::Menu::new();
+        exp_sec.append(Some("Export as PNG"), Some("win.export-png"));
+        exp_sec.append(Some("Export as JPEG"), Some("win.export-jpeg"));
+        exp_sec.append(Some("Export as WebP"), Some("win.export-webp"));
+        m.append_section(Some("Export"), &exp_sec);
+        m
+    };
+    let save_btn = gtk4::MenuButton::builder()
+        .icon_name("document-save-symbolic")
+        .tooltip_text("Save / Export")
+        .menu_model(&save_menu)
+        .sensitive(false)
+        .build();
 
     let header = adw::HeaderBar::new();
     header.pack_start(&open_btn);
+    header.pack_end(&save_btn);
     header.pack_end(&zoom_group);
+    header.pack_end(&edit_group);
 
-    // ── Layout ───────────────────────────────────────────────────────────────
-    let status_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    status_box.append(&status_label);
-    status_box.append(&zoom_label);
-
+    // ── Layout ────────────────────────────────────────────────────────────────
     let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     content.append(&scrolled);
+    content.append(&crop_bar);
     content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     content.append(&status_box);
 
@@ -145,7 +247,6 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
     toolbar_view.add_top_bar(&header);
     toolbar_view.set_content(Some(&content));
 
-    // ── Window ───────────────────────────────────────────────────────────────
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Preview")
@@ -154,119 +255,301 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         .content(&toolbar_view)
         .build();
 
-    // ── Shared closures ──────────────────────────────────────────────────────
+    // ── Canvas draw function ──────────────────────────────────────────────────
+    //
+    // Single draw func handles both the image and the crop overlay.
+    // Image transform:
+    //   fit mode  → scale to fill viewport, centered (letterbox)
+    //   zoom mode → cr.scale(zoom); content_width/height drive scrollbars
+    canvas.set_draw_func({
+        let state = state.clone();
+        move |_da, cr, width, height| {
+            let s = state.borrow();
+            let Some(ref surface) = s.surface else { return };
 
-    // apply_zoom: re-renders the picture at the current zoom level
+            let vw = width as f64;
+            let vh = height as f64;
+            let img_w = s.img_width as f64;
+            let img_h = s.img_height as f64;
+
+            let (ox, oy, scale) = if s.fit_mode {
+                image_ops::fit_transform(s.img_width, s.img_height, vw, vh)
+            } else {
+                (0.0, 0.0, s.zoom)
+            };
+
+            // Draw image
+            cr.save().unwrap();
+            cr.translate(ox, oy);
+            cr.scale(scale, scale);
+            cr.set_source_surface(surface, 0.0, 0.0).unwrap();
+            cr.source().set_filter(cairo::Filter::Bilinear);
+            cr.paint().unwrap();
+            cr.restore().unwrap();
+
+            // Crop overlay
+            if s.in_crop {
+                let rendered_w = img_w * scale;
+                let rendered_h = img_h * scale;
+                cr.set_source_rgba(0.0, 0.0, 0.0, 0.5);
+
+                if let (Some((ax, ay)), Some((bx, by))) =
+                    (s.drag_start, s.drag_end)
+                {
+                    let sx = ax.min(bx);
+                    let sy = ay.min(by);
+                    let ex = ax.max(bx);
+                    let ey = ay.max(by);
+
+                    // 4 dark bands around the selection
+                    cr.rectangle(ox, oy, rendered_w, sy - oy);
+                    cr.fill().unwrap();
+                    cr.rectangle(ox, ey, rendered_w, oy + rendered_h - ey);
+                    cr.fill().unwrap();
+                    cr.rectangle(ox, sy, sx - ox, ey - sy);
+                    cr.fill().unwrap();
+                    cr.rectangle(ex, sy, ox + rendered_w - ex, ey - sy);
+                    cr.fill().unwrap();
+
+                    // Border
+                    cr.set_source_rgba(1.0, 1.0, 1.0, 0.9);
+                    cr.set_line_width(1.5);
+                    cr.rectangle(sx, sy, ex - sx, ey - sy);
+                    cr.stroke().unwrap();
+
+                    // Rule-of-thirds grid
+                    cr.set_source_rgba(1.0, 1.0, 1.0, 0.35);
+                    cr.set_line_width(0.5);
+                    let sw = ex - sx;
+                    let sh = ey - sy;
+                    for i in 1..3 {
+                        let f = i as f64 / 3.0;
+                        cr.move_to(sx + sw * f, sy);
+                        cr.line_to(sx + sw * f, ey);
+                        cr.stroke().unwrap();
+                        cr.move_to(sx, sy + sh * f);
+                        cr.line_to(ex, sy + sh * f);
+                        cr.stroke().unwrap();
+                    }
+                } else {
+                    // No selection yet — overlay the entire image area
+                    cr.rectangle(ox, oy, rendered_w, rendered_h);
+                    cr.fill().unwrap();
+                }
+            }
+        }
+    });
+
+    // ── Closures (defined in dependency order) ────────────────────────────────
+
+    // 1. apply_zoom — updates canvas content size and queues a redraw
     let apply_zoom: Rc<dyn Fn()> = Rc::new({
-        let picture = picture.clone();
+        let canvas = canvas.clone();
         let zoom_label = zoom_label.clone();
         let zoom_out_btn = zoom_out_btn.clone();
         let zoom_in_btn = zoom_in_btn.clone();
         let state = state.clone();
-
         move || {
             let s = state.borrow();
             if !s.has_image() {
                 return;
             }
             if s.fit_mode {
-                picture.set_can_shrink(true);
-                picture.set_content_fit(gtk4::ContentFit::Contain);
-                picture.set_size_request(-1, -1);
+                // Let the canvas fill the viewport; the draw func computes scale
+                canvas.set_hexpand(true);
+                canvas.set_vexpand(true);
+                canvas.set_halign(gtk4::Align::Fill);
+                canvas.set_valign(gtk4::Align::Fill);
+                canvas.set_content_width(0);
+                canvas.set_content_height(0);
                 zoom_label.set_text("Fit");
             } else {
-                let w = (s.img_width as f64 * s.zoom).round() as i32;
-                let h = (s.img_height as f64 * s.zoom).round() as i32;
-                picture.set_can_shrink(false);
-                picture.set_content_fit(gtk4::ContentFit::Contain);
-                picture.set_size_request(w, h);
+                // Drive the scrolled window by setting the natural (content) size
+                let cw = (s.img_width as f64 * s.zoom).round() as i32;
+                let ch = (s.img_height as f64 * s.zoom).round() as i32;
+                canvas.set_hexpand(false);
+                canvas.set_vexpand(false);
+                canvas.set_halign(gtk4::Align::Center);
+                canvas.set_valign(gtk4::Align::Center);
+                canvas.set_content_width(cw);
+                canvas.set_content_height(ch);
                 zoom_label.set_text(&format!("{:.0}%", s.zoom * 100.0));
             }
             zoom_out_btn.set_sensitive(true);
             zoom_in_btn.set_sensitive(true);
+            canvas.queue_draw();
         }
     });
 
-    // ── Open file logic ──────────────────────────────────────────────────────
-
-    let load_image = {
-        let window = window.clone();
-        let picture = picture.clone();
-        let status_label = status_label.clone();
+    // 2. update_image — store new DynamicImage, build cairo surface, refresh UI
+    let update_image: Rc<dyn Fn(DynamicImage)> = Rc::new({
+        let canvas = canvas.clone();
         let state = state.clone();
         let apply_zoom = apply_zoom.clone();
+        let status_label = status_label.clone();
+        let window = window.clone();
+        let save_btn = save_btn.clone();
+        let resize_btn = resize_btn.clone();
+        let rotate_ccw_btn = rotate_ccw_btn.clone();
+        let rotate_cw_btn = rotate_cw_btn.clone();
+        let flip_h_btn = flip_h_btn.clone();
+        let flip_v_btn = flip_v_btn.clone();
+        let crop_btn = crop_btn.clone();
         let zoom_fit_btn = zoom_fit_btn.clone();
         let zoom_orig_btn = zoom_orig_btn.clone();
+        move |img: DynamicImage| {
+            let surface = image_ops::to_cairo_surface(&img);
+            let (w, h) = (img.width() as i32, img.height() as i32);
+            {
+                let mut s = state.borrow_mut();
+                s.img_width = w;
+                s.img_height = h;
+                s.surface = Some(surface);
+                s.image = Some(img);
+            }
 
-        Rc::new(move |file: gio::File| {
-            let Some(path) = file.path() else { return };
+            // Enable buttons
+            for btn in &[
+                resize_btn.upcast_ref::<gtk4::Widget>(),
+                rotate_ccw_btn.upcast_ref(),
+                rotate_cw_btn.upcast_ref(),
+                flip_h_btn.upcast_ref(),
+                flip_v_btn.upcast_ref(),
+                crop_btn.upcast_ref(),
+                zoom_fit_btn.upcast_ref(),
+                zoom_orig_btn.upcast_ref(),
+                save_btn.upcast_ref(),
+            ] {
+                btn.set_sensitive(true);
+            }
 
-            // Use GdkTexture to load image and retrieve dimensions
-            match gdk::Texture::from_filename(&path) {
-                Ok(texture) => {
-                    let w = texture.width();
-                    let h = texture.height();
+            // Update status
+            let title = window.title().unwrap_or_default();
+            let name = title.trim_end_matches(" — Preview").to_string();
+            status_label.set_markup(&format!(
+                "<b>{}</b>  {}×{} px",
+                glib::markup_escape_text(&name),
+                w,
+                h
+            ));
 
+            // Force a redraw; apply_zoom refreshes content size
+            canvas.queue_draw();
+            apply_zoom();
+        }
+    });
+
+    // 3. load_image_file — try image crate, fall back to GDK (SVG, etc.)
+    let load_image_file: Rc<dyn Fn(&std::path::Path)> = Rc::new({
+        let canvas = canvas.clone();
+        let window = window.clone();
+        let state = state.clone();
+        let status_label = status_label.clone();
+        let apply_zoom = apply_zoom.clone();
+        let update_image = update_image.clone();
+        let zoom_fit_btn = zoom_fit_btn.clone();
+        let zoom_orig_btn = zoom_orig_btn.clone();
+        let save_btn = save_btn.clone();
+        let resize_btn = resize_btn.clone();
+        let rotate_ccw_btn = rotate_ccw_btn.clone();
+        let rotate_cw_btn = rotate_cw_btn.clone();
+        let flip_h_btn = flip_h_btn.clone();
+        let flip_v_btn = flip_v_btn.clone();
+        let crop_btn = crop_btn.clone();
+
+        move |path: &std::path::Path| {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+
+            match image::open(path) {
+                Ok(img) => {
+                    window.set_title(Some(&format!("{} — Preview", name)));
                     {
                         let mut s = state.borrow_mut();
-                        s.img_width = w;
-                        s.img_height = h;
                         s.zoom = 1.0;
                         s.fit_mode = true;
+                        s.file_path = Some(path.to_path_buf());
                     }
-
-                    picture.set_paintable(Some(&texture));
-                    zoom_fit_btn.set_sensitive(true);
-                    zoom_orig_btn.set_sensitive(true);
-
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-
-                    window.set_title(Some(&format!("{} — Preview", name)));
-                    status_label.set_markup(&format!(
-                        "<b>{}</b>  {}×{} px",
-                        glib::markup_escape_text(&name),
-                        w,
-                        h
-                    ));
-                    apply_zoom();
+                    update_image(img);
                 }
-                Err(err) => {
-                    let dialog = gtk4::AlertDialog::builder()
-                        .message("Cannot Open Image")
-                        .detail(&err.to_string())
-                        .buttons(["OK"])
-                        .build();
-                    dialog.show(Some(&window));
+                Err(_) => {
+                    // Display-only fallback (SVG, etc.)
+                    let file = gio::File::for_path(path);
+                    match gdk::Texture::from_file(&file) {
+                        Ok(texture) => {
+                            let w = texture.width();
+                            let h = texture.height();
+                            // For GDK-only images, we build a cairo surface from pixels
+                            // by downloading the texture, since we can't use image crate.
+                            // For now we store no DynamicImage (no editing).
+                            {
+                                let mut s = state.borrow_mut();
+                                s.img_width = w;
+                                s.img_height = h;
+                                s.image = None;
+                                s.surface = gdk_texture_to_cairo(&texture);
+                                s.zoom = 1.0;
+                                s.fit_mode = true;
+                                s.file_path = Some(path.to_path_buf());
+                            }
+                            window.set_title(Some(&format!("{} — Preview", name)));
+                            status_label.set_markup(&format!(
+                                "<b>{}</b>  {}×{} px  (display only)",
+                                glib::markup_escape_text(&name),
+                                w,
+                                h
+                            ));
+                            for btn in &[
+                                zoom_fit_btn.upcast_ref::<gtk4::Widget>(),
+                                zoom_orig_btn.upcast_ref(),
+                                save_btn.upcast_ref(),
+                            ] {
+                                btn.set_sensitive(true);
+                            }
+                            for btn in &[
+                                resize_btn.upcast_ref::<gtk4::Widget>(),
+                                rotate_ccw_btn.upcast_ref(),
+                                rotate_cw_btn.upcast_ref(),
+                                flip_h_btn.upcast_ref(),
+                                flip_v_btn.upcast_ref(),
+                                crop_btn.upcast_ref(),
+                            ] {
+                                btn.set_sensitive(false);
+                            }
+                            canvas.queue_draw();
+                            apply_zoom();
+                        }
+                        Err(err) => {
+                            let dialog = gtk4::AlertDialog::builder()
+                                .message("Cannot Open Image")
+                                .detail(&err.to_string())
+                                .buttons(["OK"])
+                                .build();
+                            dialog.show(Some(&window));
+                        }
+                    }
                 }
             }
-        })
-    };
+        }
+    });
 
-    // Show file picker
-    let show_open_dialog = {
+    // 4. show_open_dialog
+    let show_open_dialog: Rc<dyn Fn()> = Rc::new({
         let window = window.clone();
-        let load_image = load_image.clone();
-
-        Rc::new(move || {
-            let image_filter = gtk4::FileFilter::new();
-            image_filter.set_name(Some("Images"));
+        let load_image_file = load_image_file.clone();
+        move || {
+            let filter = gtk4::FileFilter::new();
+            filter.set_name(Some("Images"));
             for mime in &[
-                "image/png",
-                "image/jpeg",
-                "image/gif",
-                "image/bmp",
-                "image/tiff",
-                "image/webp",
-                "image/svg+xml",
+                "image/png", "image/jpeg", "image/gif", "image/bmp",
+                "image/tiff", "image/webp", "image/svg+xml",
             ] {
-                image_filter.add_mime_type(mime);
+                filter.add_mime_type(mime);
             }
-
             let filters = gio::ListStore::new::<gtk4::FileFilter>();
-            filters.append(&image_filter);
+            filters.append(&filter);
 
             let dialog = gtk4::FileDialog::builder()
                 .title("Open Image")
@@ -275,21 +558,128 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
                 .build();
 
             let window = window.clone();
-            let load_image = load_image.clone();
-
-            dialog.open(
-                Some(&window),
-                gio::Cancellable::NONE,
-                move |result| {
-                    if let Ok(file) = result {
-                        load_image(file);
+            let load_image_file = load_image_file.clone();
+            dialog.open(Some(&window), gio::Cancellable::NONE, move |result| {
+                if let Ok(file) = result {
+                    if let Some(path) = file.path() {
+                        load_image_file(&path);
                     }
-                },
-            );
-        })
-    };
+                }
+            });
+        }
+    });
 
-    // ── Button callbacks ─────────────────────────────────────────────────────
+    // 5. set_crop_mode
+    let set_crop_mode: Rc<dyn Fn(bool)> = Rc::new({
+        let state = state.clone();
+        let canvas = canvas.clone();
+        let crop_bar = crop_bar.clone();
+        let edit_group = edit_group.clone();
+        let apply_crop_btn = apply_crop_btn.clone();
+        let apply_zoom = apply_zoom.clone();
+        move |active: bool| {
+            {
+                let mut s = state.borrow_mut();
+                s.in_crop = active;
+                s.drag_start = None;
+                s.drag_end = None;
+                if active {
+                    s.fit_mode = true;
+                }
+            }
+            crop_bar.set_visible(active);
+            edit_group.set_sensitive(!active);
+            apply_crop_btn.set_sensitive(false);
+            if active {
+                apply_zoom();
+            }
+            canvas.queue_draw();
+        }
+    });
+
+    // ── Crop gesture ──────────────────────────────────────────────────────────
+
+    let drag = gtk4::GestureDrag::new();
+
+    drag.connect_drag_begin({
+        let state = state.clone();
+        let canvas = canvas.clone();
+        let apply_crop_btn = apply_crop_btn.clone();
+        move |g, x, y| {
+            if !state.borrow().in_crop {
+                g.set_state(gtk4::EventSequenceState::Denied);
+                return;
+            }
+            let mut s = state.borrow_mut();
+            // Clamp to image bounds
+            let vw = canvas.width() as f64;
+            let vh = canvas.height() as f64;
+            let (ox, oy, scale) =
+                image_ops::fit_transform(s.img_width, s.img_height, vw, vh);
+            let cx = x.clamp(ox, ox + s.img_width as f64 * scale);
+            let cy = y.clamp(oy, oy + s.img_height as f64 * scale);
+            s.drag_start = Some((cx, cy));
+            s.drag_end = Some((cx, cy));
+            apply_crop_btn.set_sensitive(false);
+            drop(s);
+            canvas.queue_draw();
+        }
+    });
+
+    drag.connect_drag_update({
+        let state = state.clone();
+        let canvas = canvas.clone();
+        move |g, dx, dy| {
+            if !state.borrow().in_crop {
+                return;
+            }
+            let Some((sx, sy)) = g.start_point() else { return };
+            let mut s = state.borrow_mut();
+            let vw = canvas.width() as f64;
+            let vh = canvas.height() as f64;
+            let (ox, oy, scale) =
+                image_ops::fit_transform(s.img_width, s.img_height, vw, vh);
+            let ex = (sx + dx).clamp(ox, ox + s.img_width as f64 * scale);
+            let ey = (sy + dy).clamp(oy, oy + s.img_height as f64 * scale);
+            s.drag_end = Some((ex, ey));
+            drop(s);
+            canvas.queue_draw();
+        }
+    });
+
+    drag.connect_drag_end({
+        let state = state.clone();
+        let canvas = canvas.clone();
+        let apply_crop_btn = apply_crop_btn.clone();
+        move |g, dx, dy| {
+            if !state.borrow().in_crop {
+                return;
+            }
+            let Some((sx, sy)) = g.start_point() else { return };
+            let mut s = state.borrow_mut();
+            let vw = canvas.width() as f64;
+            let vh = canvas.height() as f64;
+            let (ox, oy, scale) =
+                image_ops::fit_transform(s.img_width, s.img_height, vw, vh);
+            let ex = (sx + dx).clamp(ox, ox + s.img_width as f64 * scale);
+            let ey = (sy + dy).clamp(oy, oy + s.img_height as f64 * scale);
+            s.drag_end = Some((ex, ey));
+            let valid = s
+                .drag_start
+                .zip(s.drag_end)
+                .map(|((ax, ay), (bx, by))| {
+                    (ax - bx).abs() > 4.0 && (ay - by).abs() > 4.0
+                })
+                .unwrap_or(false);
+            drop(s);
+            apply_crop_btn.set_sensitive(valid);
+            canvas.queue_draw();
+        }
+    });
+
+    canvas.add_controller(drag);
+
+    // ── Button callbacks ──────────────────────────────────────────────────────
 
     open_btn.connect_clicked({
         let show_open_dialog = show_open_dialog.clone();
@@ -301,29 +691,23 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         let apply_zoom = apply_zoom.clone();
         move |_| {
             let mut s = state.borrow_mut();
-            if s.fit_mode {
-                s.fit_mode = false;
-            }
+            if s.fit_mode { s.fit_mode = false; }
             s.zoom = (s.zoom * 1.25).min(32.0);
             drop(s);
             apply_zoom();
         }
     });
-
     zoom_out_btn.connect_clicked({
         let state = state.clone();
         let apply_zoom = apply_zoom.clone();
         move |_| {
             let mut s = state.borrow_mut();
-            if s.fit_mode {
-                s.fit_mode = false;
-            }
+            if s.fit_mode { s.fit_mode = false; }
             s.zoom = (s.zoom / 1.25).max(0.05);
             drop(s);
             apply_zoom();
         }
     });
-
     zoom_fit_btn.connect_clicked({
         let state = state.clone();
         let apply_zoom = apply_zoom.clone();
@@ -332,7 +716,6 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
             apply_zoom();
         }
     });
-
     zoom_orig_btn.connect_clicked({
         let state = state.clone();
         let apply_zoom = apply_zoom.clone();
@@ -345,8 +728,103 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         }
     });
 
-    // ── Mouse wheel zoom (Ctrl + scroll) ─────────────────────────────────────
+    resize_btn.connect_clicked({
+        let state = state.clone();
+        let window = window.clone();
+        let update_image = update_image.clone();
+        move |_| {
+            let (w, h) = {
+                let s = state.borrow();
+                (s.img_width as u32, s.img_height as u32)
+            };
+            let state = state.clone();
+            let update_image = update_image.clone();
+            show_resize_dialog(&window, w, h, move |nw, nh| {
+                let img = state.borrow().image.as_ref().map(|i| i.clone());
+                if let Some(img) = img {
+                    update_image(image_ops::resize(&img, nw, nh));
+                }
+            });
+        }
+    });
 
+    rotate_cw_btn.connect_clicked({
+        let state = state.clone();
+        let update_image = update_image.clone();
+        move |_| {
+            let img = state.borrow().image.as_ref().map(|i| i.clone());
+            if let Some(img) = img { update_image(image_ops::rotate_cw(&img)); }
+        }
+    });
+    rotate_ccw_btn.connect_clicked({
+        let state = state.clone();
+        let update_image = update_image.clone();
+        move |_| {
+            let img = state.borrow().image.as_ref().map(|i| i.clone());
+            if let Some(img) = img { update_image(image_ops::rotate_ccw(&img)); }
+        }
+    });
+    flip_h_btn.connect_clicked({
+        let state = state.clone();
+        let update_image = update_image.clone();
+        move |_| {
+            let img = state.borrow().image.as_ref().map(|i| i.clone());
+            if let Some(img) = img { update_image(image_ops::flip_h(&img)); }
+        }
+    });
+    flip_v_btn.connect_clicked({
+        let state = state.clone();
+        let update_image = update_image.clone();
+        move |_| {
+            let img = state.borrow().image.as_ref().map(|i| i.clone());
+            if let Some(img) = img { update_image(image_ops::flip_v(&img)); }
+        }
+    });
+
+    crop_btn.connect_clicked({
+        let set_crop_mode = set_crop_mode.clone();
+        move |_| set_crop_mode(true)
+    });
+    cancel_crop_btn.connect_clicked({
+        let set_crop_mode = set_crop_mode.clone();
+        move |_| set_crop_mode(false)
+    });
+
+    apply_crop_btn.connect_clicked({
+        let state = state.clone();
+        let canvas = canvas.clone();
+        let update_image = update_image.clone();
+        let set_crop_mode = set_crop_mode.clone();
+        move |_| {
+            let (crop_rect, img) = {
+                let s = state.borrow();
+                let vw = canvas.width() as f64;
+                let vh = canvas.height() as f64;
+                let (ox, oy, scale) =
+                    image_ops::fit_transform(s.img_width, s.img_height, vw, vh);
+                let rect = s.drag_start.zip(s.drag_end).map(|((ax, ay), (bx, by))| {
+                    let (x1, y1) = image_ops::widget_to_img(
+                        ax.min(bx), ay.min(by),
+                        s.img_width, s.img_height, ox, oy, scale,
+                    );
+                    let (x2, y2) = image_ops::widget_to_img(
+                        ax.max(bx), ay.max(by),
+                        s.img_width, s.img_height, ox, oy, scale,
+                    );
+                    (x1, y1, x2.saturating_sub(x1), y2.saturating_sub(y1))
+                });
+                (rect, s.image.as_ref().map(|i| i.clone()))
+            };
+            if let (Some((x, y, w, h)), Some(img)) = (crop_rect, img) {
+                if let Some(cropped) = image_ops::crop(&img, x, y, w, h) {
+                    update_image(cropped);
+                }
+            }
+            set_crop_mode(false);
+        }
+    });
+
+    // ── Scroll-wheel zoom (Ctrl + scroll) ─────────────────────────────────────
     let scroll_ctrl = gtk4::EventControllerScroll::new(
         gtk4::EventControllerScrollFlags::VERTICAL
             | gtk4::EventControllerScrollFlags::DISCRETE,
@@ -355,22 +833,17 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         let state = state.clone();
         let apply_zoom = apply_zoom.clone();
         move |ctrl, _dx, dy| {
-            let modifiers = ctrl.current_event_state();
-            if !modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
+            if !ctrl
+                .current_event_state()
+                .contains(gdk::ModifierType::CONTROL_MASK)
+            {
                 return glib::Propagation::Proceed;
             }
             let mut s = state.borrow_mut();
-            if !s.has_image() {
-                return glib::Propagation::Proceed;
-            }
-            if s.fit_mode {
-                s.fit_mode = false;
-            }
-            if dy < 0.0 {
-                s.zoom = (s.zoom * 1.15).min(32.0);
-            } else {
-                s.zoom = (s.zoom / 1.15).max(0.05);
-            }
+            if !s.has_image() { return glib::Propagation::Proceed; }
+            if s.fit_mode { s.fit_mode = false; }
+            if dy < 0.0 { s.zoom = (s.zoom * 1.15).min(32.0); }
+            else         { s.zoom = (s.zoom / 1.15).max(0.05); }
             drop(s);
             apply_zoom();
             glib::Propagation::Stop
@@ -378,22 +851,23 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
     });
     scrolled.add_controller(scroll_ctrl);
 
-    // ── Drag and drop ────────────────────────────────────────────────────────
-
+    // ── Drag-and-drop ─────────────────────────────────────────────────────────
     let drop_target = gtk4::DropTarget::new(gio::File::static_type(), gdk::DragAction::COPY);
     drop_target.connect_drop({
-        let load_image = load_image.clone();
+        let load_image_file = load_image_file.clone();
         move |_, value, _, _| {
             if let Ok(file) = value.get::<gio::File>() {
-                load_image(file);
-                return true;
+                if let Some(path) = file.path() {
+                    load_image_file(&path);
+                    return true;
+                }
             }
             false
         }
     });
     window.add_controller(drop_target);
 
-    // ── Window-level actions (keyboard shortcuts) ─────────────────────────────
+    // ── Window actions ────────────────────────────────────────────────────────
 
     let act_open = gio::SimpleAction::new("open", None);
     act_open.connect_activate({
@@ -407,9 +881,7 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         let apply_zoom = apply_zoom.clone();
         move |_, _| {
             let mut s = state.borrow_mut();
-            if s.fit_mode {
-                s.fit_mode = false;
-            }
+            if s.fit_mode { s.fit_mode = false; }
             s.zoom = (s.zoom * 1.25).min(32.0);
             drop(s);
             apply_zoom();
@@ -422,9 +894,7 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         let apply_zoom = apply_zoom.clone();
         move |_, _| {
             let mut s = state.borrow_mut();
-            if s.fit_mode {
-                s.fit_mode = false;
-            }
+            if s.fit_mode { s.fit_mode = false; }
             s.zoom = (s.zoom / 1.25).max(0.05);
             drop(s);
             apply_zoom();
@@ -454,42 +924,118 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         }
     });
 
-    let act_fullscreen = gio::SimpleAction::new_stateful(
-        "fullscreen",
-        None,
-        &false.to_variant(),
-    );
+    let act_fullscreen =
+        gio::SimpleAction::new_stateful("fullscreen", None, &false.to_variant());
     act_fullscreen.connect_activate({
         let window = window.clone();
         move |action, _| {
-            let is_fs = action
-                .state()
-                .and_then(|v| v.get::<bool>())
-                .unwrap_or(false);
-            if is_fs {
-                window.unfullscreen();
-                action.set_state(&false.to_variant());
-            } else {
-                window.fullscreen();
-                action.set_state(&true.to_variant());
+            let is_fs = action.state().and_then(|v| v.get::<bool>()).unwrap_or(false);
+            if is_fs { window.unfullscreen(); action.set_state(&false.to_variant()); }
+            else      { window.fullscreen();   action.set_state(&true.to_variant()); }
+        }
+    });
+
+    // ── Save actions ──────────────────────────────────────────────────────────
+
+    // Save (overwrite original file)
+    let act_save = gio::SimpleAction::new("save", None);
+    act_save.connect_activate({
+        let state = state.clone();
+        let window = window.clone();
+        move |_, _| {
+            let (img, path) = {
+                let s = state.borrow();
+                (s.image.as_ref().map(|i| i.clone()), s.file_path.clone())
+            };
+            if let (Some(img), Some(path)) = (img, path) {
+                if let Err(e) = image_ops::save_image(&img, &path) {
+                    show_error(&window, "Save failed", &e.to_string());
+                }
             }
         }
     });
 
-    window.add_action(&act_open);
-    window.add_action(&act_zoom_in);
-    window.add_action(&act_zoom_out);
-    window.add_action(&act_zoom_fit);
-    window.add_action(&act_zoom_orig);
-    window.add_action(&act_fullscreen);
+    // Save As (pick new path, update file_path, keep format from extension)
+    let act_save_as = gio::SimpleAction::new("save-as", None);
+    act_save_as.connect_activate({
+        let state = state.clone();
+        let window = window.clone();
+        move |_, _| {
+            let (img, current_path) = {
+                let s = state.borrow();
+                (s.image.as_ref().map(|i| i.clone()), s.file_path.clone())
+            };
+            if img.is_none() { return; }
+            let img = img.unwrap();
+            let state = state.clone();
+            let window = window.clone();
+            let window2 = window.clone();
+            show_save_dialog(&window, current_path.as_deref(), None, move |path| {
+                if let Err(e) = image_ops::save_image(&img, &path) {
+                    show_error(&window2, "Save failed", &e.to_string());
+                    return;
+                }
+                let name = path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                window2.set_title(Some(&format!("{} — Preview", name)));
+                state.borrow_mut().file_path = Some(path);
+            });
+        }
+    });
 
-    app.set_accels_for_action("win.open", &["<Ctrl>o"]);
-    app.set_accels_for_action("win.zoom-in", &["plus", "equal", "<Ctrl>equal"]);
-    app.set_accels_for_action("win.zoom-out", &["minus", "<Ctrl>minus"]);
-    app.set_accels_for_action("win.zoom-fit", &["3", "<Ctrl>0"]);
+    // Export as PNG / JPEG / WebP — file dialog, do NOT update file_path
+    let make_export_action = |ext: &'static str| {
+        let act = gio::SimpleAction::new(&format!("export-{}", ext), None);
+        let state = state.clone();
+        let window = window.clone();
+        act.connect_activate(move |_, _| {
+            let img = state.borrow().image.as_ref().map(|i| i.clone());
+            if img.is_none() { return; }
+            let img = img.unwrap();
+            let current_path = state.borrow().file_path.clone();
+            // Suggest filename with new extension
+            let suggested = current_path.as_deref().and_then(|p| p.file_stem())
+                .map(|s| format!("{}.{}", s.to_string_lossy(), ext));
+            let window = window.clone();
+            let window2 = window.clone();
+            show_save_dialog(&window, None, suggested.as_deref(), move |path| {
+                if let Err(e) = image_ops::save_image(&img, &path) {
+                    show_error(&window2, "Export failed", &e.to_string());
+                }
+            });
+        });
+        act
+    };
+    let act_export_png  = make_export_action("png");
+    let act_export_jpeg = make_export_action("jpeg");
+    let act_export_webp = make_export_action("webp");
+
+    for a in &[
+        act_open.upcast_ref::<gio::Action>(),
+        act_zoom_in.upcast_ref(),
+        act_zoom_out.upcast_ref(),
+        act_zoom_fit.upcast_ref(),
+        act_zoom_orig.upcast_ref(),
+        act_fullscreen.upcast_ref(),
+        act_save.upcast_ref(),
+        act_save_as.upcast_ref(),
+        act_export_png.upcast_ref(),
+        act_export_jpeg.upcast_ref(),
+        act_export_webp.upcast_ref(),
+    ] {
+        window.add_action(*a);
+    }
+
+    app.set_accels_for_action("win.open",      &["<Ctrl>o"]);
+    app.set_accels_for_action("win.zoom-in",   &["plus", "equal", "<Ctrl>equal"]);
+    app.set_accels_for_action("win.zoom-out",  &["minus", "<Ctrl>minus"]);
+    app.set_accels_for_action("win.zoom-fit",  &["3", "<Ctrl>0"]);
     app.set_accels_for_action("win.zoom-orig", &["1"]);
-    app.set_accels_for_action("win.fullscreen", &["F11"]);
-    app.set_accels_for_action("app.quit", &["<Ctrl>q"]);
+    app.set_accels_for_action("win.fullscreen",&["F11"]);
+    app.set_accels_for_action("win.save",      &["<Ctrl>s"]);
+    app.set_accels_for_action("win.save-as",   &["<Ctrl><Shift>s"]);
+    app.set_accels_for_action("app.quit",      &["<Ctrl>q"]);
 
     let act_quit = gio::SimpleAction::new("quit", None);
     act_quit.connect_activate({
@@ -498,12 +1044,231 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
     });
     app.add_action(&act_quit);
 
-    // ── Open initial file if given on command line ────────────────────────────
-
+    // ── Initial file ──────────────────────────────────────────────────────────
     if let Some(path) = initial_file {
-        let file = gio::File::for_path(path);
-        load_image(file);
+        load_image_file(path);
     }
 
     window.present();
+}
+
+// ── Resize dialog ─────────────────────────────────────────────────────────────
+
+fn show_resize_dialog(
+    parent: &adw::ApplicationWindow,
+    current_w: u32,
+    current_h: u32,
+    on_apply: impl Fn(u32, u32) + 'static,
+) {
+    let dialog = adw::Window::builder()
+        .title("Resize Image")
+        .transient_for(parent)
+        .modal(true)
+        .default_width(340)
+        .resizable(false)
+        .build();
+
+    let width_row = adw::SpinRow::with_range(1.0, 32767.0, 1.0);
+    width_row.set_title("Width");
+    width_row.set_digits(0);
+    width_row.set_value(current_w as f64);
+
+    let height_row = adw::SpinRow::with_range(1.0, 32767.0, 1.0);
+    height_row.set_title("Height");
+    height_row.set_digits(0);
+    height_row.set_value(current_h as f64);
+
+    let lock_row = adw::SwitchRow::new();
+    lock_row.set_title("Lock aspect ratio");
+    lock_row.set_active(true);
+
+    let dim_group = adw::PreferencesGroup::new();
+    dim_group.add(&width_row);
+    dim_group.add(&height_row);
+    dim_group.add(&lock_row);
+    dim_group.set_margin_top(12);
+    dim_group.set_margin_bottom(8);
+    dim_group.set_margin_start(12);
+    dim_group.set_margin_end(12);
+
+    let ratio = current_w as f64 / current_h as f64;
+    let updating = Rc::new(Cell::new(false));
+
+    width_row.connect_value_notify({
+        let height_row = height_row.clone();
+        let lock_row = lock_row.clone();
+        let updating = updating.clone();
+        move |row| {
+            if updating.get() { return; }
+            if lock_row.is_active() {
+                updating.set(true);
+                height_row.set_value((row.value() / ratio).round().max(1.0));
+                updating.set(false);
+            }
+        }
+    });
+
+    height_row.connect_value_notify({
+        let width_row = width_row.clone();
+        let lock_row = lock_row.clone();
+        let updating = updating.clone();
+        move |row| {
+            if updating.get() { return; }
+            if lock_row.is_active() {
+                updating.set(true);
+                width_row.set_value((row.value() * ratio).round().max(1.0));
+                updating.set(false);
+            }
+        }
+    });
+
+    let cancel_btn = gtk4::Button::with_label("Cancel");
+    let resize_btn = gtk4::Button::with_label("Resize");
+    resize_btn.add_css_class("suggested-action");
+
+    let btn_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    btn_box.set_halign(gtk4::Align::End);
+    btn_box.set_margin_start(12);
+    btn_box.set_margin_end(12);
+    btn_box.set_margin_top(4);
+    btn_box.set_margin_bottom(12);
+    btn_box.append(&cancel_btn);
+    btn_box.append(&resize_btn);
+
+    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    content.append(&dim_group);
+    content.append(&btn_box);
+
+    let hb = adw::HeaderBar::new();
+    let tv = adw::ToolbarView::new();
+    tv.add_top_bar(&hb);
+    tv.set_content(Some(&content));
+    dialog.set_content(Some(&tv));
+
+    cancel_btn.connect_clicked({
+        let dialog = dialog.clone();
+        move |_| dialog.close()
+    });
+    resize_btn.connect_clicked({
+        let dialog = dialog.clone();
+        let width_row = width_row.clone();
+        let height_row = height_row.clone();
+        move |_| {
+            on_apply(width_row.value() as u32, height_row.value() as u32);
+            dialog.close();
+        }
+    });
+
+    dialog.present();
+}
+
+// ── Save / Export dialog ──────────────────────────────────────────────────────
+
+fn show_save_dialog(
+    parent: &adw::ApplicationWindow,
+    current_path: Option<&std::path::Path>,
+    suggested_name: Option<&str>,
+    on_save: impl Fn(PathBuf) + 'static,
+) {
+    let filters = gio::ListStore::new::<gtk4::FileFilter>();
+    for (label, mime, ext) in &[
+        ("PNG",  "image/png",  "png"),
+        ("JPEG", "image/jpeg", "jpg"),
+        ("WebP", "image/webp", "webp"),
+        ("TIFF", "image/tiff", "tiff"),
+        ("BMP",  "image/bmp",  "bmp"),
+    ] {
+        let f = gtk4::FileFilter::new();
+        f.set_name(Some(label));
+        f.add_mime_type(mime);
+        f.add_suffix(ext);
+        filters.append(&f);
+    }
+
+    let dialog = gtk4::FileDialog::builder()
+        .title("Save Image")
+        .modal(true)
+        .filters(&filters)
+        .build();
+
+    // Set initial folder from current path
+    if let Some(p) = current_path {
+        if let Some(parent_dir) = p.parent() {
+            dialog.set_initial_folder(Some(&gio::File::for_path(parent_dir)));
+        }
+    }
+
+    // Set initial filename
+    let initial = suggested_name
+        .map(|s| s.to_string())
+        .or_else(|| {
+            current_path
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+        });
+    if let Some(name) = initial {
+        dialog.set_initial_name(Some(&name));
+    }
+
+    let parent = parent.clone();
+    dialog.save(Some(&parent), gio::Cancellable::NONE, move |result| {
+        if let Ok(file) = result {
+            if let Some(path) = file.path() {
+                on_save(path);
+            }
+        }
+    });
+}
+
+// ── Error dialog ──────────────────────────────────────────────────────────────
+
+fn show_error(parent: &adw::ApplicationWindow, title: &str, detail: &str) {
+    let dialog = gtk4::AlertDialog::builder()
+        .message(title)
+        .detail(detail)
+        .buttons(["OK"])
+        .build();
+    dialog.show(Some(parent));
+}
+
+// ── GDK texture → Cairo surface (for display-only formats like SVG) ───────────
+
+fn gdk_texture_to_cairo(texture: &gdk::Texture) -> Option<cairo::ImageSurface> {
+    let w = texture.width();
+    let h = texture.height();
+    let stride = (w * 4) as usize;
+    // download() gives RGBA straight-alpha
+    let mut rgba = vec![0u8; stride * h as usize];
+    texture.download(&mut rgba, stride);
+    // Convert to premultiplied BGRA (cairo ARgb32 on little-endian)
+    let mut bgra: Vec<u8> = Vec::with_capacity(rgba.len());
+    for chunk in rgba.chunks_exact(4) {
+        let r = chunk[0] as u32;
+        let g = chunk[1] as u32;
+        let b = chunk[2] as u32;
+        let a = chunk[3] as u32;
+        bgra.push(((b * a + 127) / 255) as u8);
+        bgra.push(((g * a + 127) / 255) as u8);
+        bgra.push(((r * a + 127) / 255) as u8);
+        bgra.push(a as u8);
+    }
+    cairo::ImageSurface::create_for_data(
+        bgra,
+        cairo::Format::ARgb32,
+        w,
+        h,
+        stride as i32,
+    )
+    .ok()
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn linked_box(buttons: &[&gtk4::Widget]) -> gtk4::Box {
+    let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    b.add_css_class("linked");
+    for btn in buttons {
+        b.append(*btn);
+    }
+    b
 }

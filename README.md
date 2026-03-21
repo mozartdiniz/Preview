@@ -32,21 +32,22 @@ Built with **Rust + GTK4 + libadwaita** for a native GNOME experience.
 - [ ] Open recent files
 
 ### File Management
-- [ ] Save (overwrite original)
-- [ ] Save As (with format conversion: PNG, JPEG, WebP, TIFF, BMP)
-- [ ] Export to different format
+- [x] Save (overwrite original, Ctrl+S)
+- [x] Save As (Ctrl+Shift+S)
+- [x] Export as PNG / JPEG / WebP (from save menu)
+- [ ] Export as TIFF / BMP
 - [ ] Print
 - [ ] Copy image to clipboard
 - [ ] Paste image from clipboard
 
 ### Image Adjustments
-- [ ] Crop (interactive drag selection)
-- [ ] Resize (width × height with aspect ratio lock)
-- [ ] Rotate 90° clockwise
-- [ ] Rotate 90° counter-clockwise
+- [x] Crop (interactive drag selection)
+- [x] Resize (width × height with aspect ratio lock)
+- [x] Rotate 90° clockwise
+- [x] Rotate 90° counter-clockwise
 - [ ] Rotate arbitrary angle
-- [ ] Flip horizontal
-- [ ] Flip vertical
+- [x] Flip horizontal
+- [x] Flip vertical
 - [ ] Adjust brightness / exposure
 - [ ] Adjust contrast
 - [ ] Adjust saturation / vibrance
