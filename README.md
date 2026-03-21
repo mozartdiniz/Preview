@@ -65,7 +65,7 @@ Built with **Rust + GTK4 + libadwaita** for a native GNOME experience.
 - [ ] Rectangle shape
 - [ ] Circle / ellipse shape
 - [ ] Polygon shape
-- [ ] Text label (font, size, style)
+- [x] Text label (font, size, style)
 - [ ] Highlight / marker tool
 - [ ] Loupe / magnify tool
 - [ ] Change annotation stroke color (color picker)

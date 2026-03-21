@@ -1,6 +1,74 @@
 use gtk4::cairo;
+use gtk4::pango;
+
 use image::{DynamicImage, imageops::FilterType};
 use std::path::Path;
+
+// ── Text annotation ───────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct TextAnnotation {
+    /// Position in image-pixel coordinates (top-left corner of the text).
+    pub x: f64,
+    pub y: f64,
+    pub text: String,
+    pub font_desc: pango::FontDescription,
+    /// RGBA components in 0.0 – 1.0.
+    pub color: (f64, f64, f64, f64),
+}
+
+/// Draw a single annotation onto the given Cairo context.
+/// The context must already be in image-space (scaled/translated by the caller).
+pub fn draw_text_annotation(cr: &cairo::Context, ann: &TextAnnotation) {
+    let layout = pangocairo::functions::create_layout(cr);
+    layout.set_font_description(Some(&ann.font_desc));
+    layout.set_text(&ann.text);
+    cr.set_source_rgba(ann.color.0, ann.color.1, ann.color.2, ann.color.3);
+    cr.move_to(ann.x, ann.y);
+    pangocairo::functions::show_layout(cr, &layout);
+}
+
+/// Flatten all annotations onto `img`, returning a new `DynamicImage`.
+pub fn flatten_annotations(img: &DynamicImage, annotations: &[TextAnnotation]) -> DynamicImage {
+    if annotations.is_empty() {
+        return img.clone();
+    }
+    let mut surface = to_cairo_surface(img);
+    {
+        let cr = cairo::Context::new(&surface).expect("cairo context");
+        for ann in annotations {
+            draw_text_annotation(&cr, ann);
+        }
+    } // cr dropped — all drawing complete before we read back pixel data
+    surface_to_image(&mut surface).unwrap_or_else(|| img.clone())
+}
+
+/// Convert a Cairo ARgb32 surface back to a `DynamicImage` (un-premultiplies alpha).
+pub fn surface_to_image(surface: &mut cairo::ImageSurface) -> Option<DynamicImage> {
+    let w = surface.width() as u32;
+    let h = surface.height() as u32;
+    let stride = surface.stride() as usize;
+    let data = surface.data().ok()?;
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for row in 0..h as usize {
+        for col in 0..w as usize {
+            let off = row * stride + col * 4;
+            let b = data[off] as u32;
+            let g = data[off + 1] as u32;
+            let r = data[off + 2] as u32;
+            let a = data[off + 3] as u32;
+            if a == 0 {
+                rgba.extend_from_slice(&[0, 0, 0, 0]);
+            } else {
+                rgba.push(((r * 255 + a / 2) / a).min(255) as u8);
+                rgba.push(((g * 255 + a / 2) / a).min(255) as u8);
+                rgba.push(((b * 255 + a / 2) / a).min(255) as u8);
+                rgba.push(a as u8);
+            }
+        }
+    }
+    Some(DynamicImage::ImageRgba8(image::RgbaImage::from_raw(w, h, rgba)?))
+}
 
 // ── Display conversion ────────────────────────────────────────────────────────
 

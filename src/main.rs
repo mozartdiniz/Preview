@@ -32,6 +32,17 @@ struct State {
     in_crop: bool,
     drag_start: Option<(f64, f64)>,
     drag_end: Option<(f64, f64)>,
+    // Text annotation tool
+    annotations: Vec<image_ops::TextAnnotation>,
+    text_tool_active: bool,
+    text_font_desc: Option<gtk4::pango::FontDescription>,
+    text_color: (f64, f64, f64, f64),
+    // Draft annotation being typed (image-space coords)
+    draft_pos: Option<(f64, f64)>,
+    draft_text: String,
+    // Selected annotation index (for drag-to-move)
+    selected_ann: Option<usize>,
+    move_origin: Option<(f64, f64)>,  // annotation's image coords at drag start
 }
 
 impl State {
@@ -39,6 +50,7 @@ impl State {
         Self {
             zoom: 1.0,
             fit_mode: true,
+            text_color: (1.0, 0.0, 0.0, 1.0),
             ..Default::default()
         }
     }
@@ -135,6 +147,44 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
     crop_bar.append(&crop_hint);
     crop_bar.append(&apply_crop_btn);
 
+    // ── Inline text entry popover (anchored to canvas, shown on click) ────────
+    let draft_entry = gtk4::Entry::builder()
+        .placeholder_text("Type and press Enter…")
+        .width_request(240)
+        .build();
+    let text_popover = gtk4::Popover::new();
+    text_popover.set_child(Some(&draft_entry));
+    text_popover.set_has_arrow(true);
+    text_popover.set_autohide(false);
+
+    // ── Text annotation toolbar ───────────────────────────────────────────────
+    let font_dialog = gtk4::FontDialog::new();
+    let font_btn = gtk4::FontDialogButton::new(Some(font_dialog));
+    font_btn.set_font_desc(&gtk4::pango::FontDescription::from_string("Sans 24"));
+
+    let color_dialog = gtk4::ColorDialog::new();
+    let color_btn = gtk4::ColorDialogButton::new(Some(color_dialog));
+    color_btn.set_rgba(&gdk::RGBA::new(1.0, 0.0, 0.0, 1.0));
+
+    let done_text_btn = gtk4::Button::with_label("Done");
+    let text_hint = gtk4::Label::builder()
+        .label("Click image to place text — drag to move")
+        .hexpand(true)
+        .halign(gtk4::Align::Center)
+        .build();
+    text_hint.add_css_class("dim-label");
+
+    let text_tool_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    text_tool_bar.set_visible(false);
+    text_tool_bar.set_margin_start(12);
+    text_tool_bar.set_margin_end(12);
+    text_tool_bar.set_margin_top(6);
+    text_tool_bar.set_margin_bottom(6);
+    text_tool_bar.append(&done_text_btn);
+    text_tool_bar.append(&text_hint);
+    text_tool_bar.append(&font_btn);
+    text_tool_bar.append(&color_btn);
+
     // ── Header bar ────────────────────────────────────────────────────────────
     let open_btn = gtk4::Button::builder()
         .icon_name("document-open-symbolic")
@@ -200,6 +250,11 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         .tooltip_text("Crop Image")
         .sensitive(false)
         .build();
+    let text_btn = gtk4::Button::builder()
+        .icon_name("insert-text-symbolic")
+        .tooltip_text("Add Text Annotation")
+        .sensitive(false)
+        .build();
     let edit_group = linked_box(&[
         resize_btn.upcast_ref(),
         rotate_ccw_btn.upcast_ref(),
@@ -207,6 +262,7 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         flip_h_btn.upcast_ref(),
         flip_v_btn.upcast_ref(),
         crop_btn.upcast_ref(),
+        text_btn.upcast_ref(),
     ]);
 
     // Save menu button
@@ -240,6 +296,7 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
     let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     content.append(&scrolled);
     content.append(&crop_bar);
+    content.append(&text_tool_bar);
     content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     content.append(&status_box);
 
@@ -254,6 +311,9 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         .default_height(768)
         .content(&toolbar_view)
         .build();
+
+    // Attach the draft-text popover to the canvas now that the widget tree exists
+    text_popover.set_parent(&canvas);
 
     // ── Canvas draw function ──────────────────────────────────────────────────
     //
@@ -285,6 +345,50 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
             cr.set_source_surface(surface, 0.0, 0.0).unwrap();
             cr.source().set_filter(cairo::Filter::Bilinear);
             cr.paint().unwrap();
+            // Draw committed annotations
+            for (i, ann) in s.annotations.iter().enumerate() {
+                image_ops::draw_text_annotation(cr, ann);
+                // Selection outline when text tool is active
+                if s.text_tool_active && s.selected_ann == Some(i) {
+                    let layout = pangocairo::functions::create_layout(cr);
+                    layout.set_font_description(Some(&ann.font_desc));
+                    layout.set_text(&ann.text);
+                    let (_, ext) = layout.pixel_extents();
+                    let pad = 4.0 / scale;
+                    cr.set_source_rgba(0.2, 0.6, 1.0, 0.9);
+                    cr.set_line_width(1.5 / scale);
+                    cr.set_dash(&[5.0 / scale, 4.0 / scale], 0.0);
+                    cr.rectangle(
+                        ann.x + ext.x() as f64 - pad,
+                        ann.y + ext.y() as f64 - pad,
+                        ext.width() as f64 + pad * 2.0,
+                        ext.height() as f64 + pad * 2.0,
+                    );
+                    cr.stroke().unwrap();
+                    cr.set_dash(&[], 0.0);
+                }
+            }
+            // Draw draft annotation (live preview while typing)
+            if let Some((dx, dy)) = s.draft_pos {
+                if !s.draft_text.is_empty() {
+                    let preview = image_ops::TextAnnotation {
+                        x: dx,
+                        y: dy,
+                        text: s.draft_text.clone(),
+                        font_desc: s
+                            .text_font_desc
+                            .clone()
+                            .unwrap_or_else(|| gtk4::pango::FontDescription::from_string("Sans 24")),
+                        color: s.text_color,
+                    };
+                    image_ops::draw_text_annotation(cr, &preview);
+                }
+                // Placement cursor dot
+                let dot = 4.0 / scale;
+                cr.set_source_rgba(1.0, 0.9, 0.0, 0.9);
+                cr.arc(dx, dy, dot, 0.0, std::f64::consts::TAU);
+                cr.fill().unwrap();
+            }
             cr.restore().unwrap();
 
             // Crop overlay
@@ -395,6 +499,7 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         let flip_h_btn = flip_h_btn.clone();
         let flip_v_btn = flip_v_btn.clone();
         let crop_btn = crop_btn.clone();
+        let text_btn = text_btn.clone();
         let zoom_fit_btn = zoom_fit_btn.clone();
         let zoom_orig_btn = zoom_orig_btn.clone();
         move |img: DynamicImage| {
@@ -406,6 +511,7 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
                 s.img_height = h;
                 s.surface = Some(surface);
                 s.image = Some(img);
+                s.annotations.clear();
             }
 
             // Enable buttons
@@ -416,6 +522,7 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
                 flip_h_btn.upcast_ref(),
                 flip_v_btn.upcast_ref(),
                 crop_btn.upcast_ref(),
+                text_btn.upcast_ref(),
                 zoom_fit_btn.upcast_ref(),
                 zoom_orig_btn.upcast_ref(),
                 save_btn.upcast_ref(),
@@ -456,6 +563,7 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         let flip_h_btn = flip_h_btn.clone();
         let flip_v_btn = flip_v_btn.clone();
         let crop_btn = crop_btn.clone();
+        let text_btn = text_btn.clone();
 
         move |path: &std::path::Path| {
             let name = path
@@ -493,6 +601,7 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
                                 s.zoom = 1.0;
                                 s.fit_mode = true;
                                 s.file_path = Some(path.to_path_buf());
+                                s.annotations.clear();
                             }
                             window.set_title(Some(&format!("{} — Preview", name)));
                             status_label.set_markup(&format!(
@@ -515,6 +624,7 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
                                 flip_h_btn.upcast_ref(),
                                 flip_v_btn.upcast_ref(),
                                 crop_btn.upcast_ref(),
+                                text_btn.upcast_ref(),
                             ] {
                                 btn.set_sensitive(false);
                             }
@@ -597,9 +707,260 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         }
     });
 
+    // 6. commit_draft — push any in-progress annotation to the list
+    let commit_draft: Rc<dyn Fn()> = Rc::new({
+        let state = state.clone();
+        let canvas = canvas.clone();
+        let text_popover = text_popover.clone();
+        let draft_entry = draft_entry.clone();
+        move || {
+            let mut s = state.borrow_mut();
+            if let Some((dx, dy)) = s.draft_pos.take() {
+                let text = std::mem::take(&mut s.draft_text);
+                if !text.is_empty() {
+                    let font_desc = s
+                        .text_font_desc
+                        .clone()
+                        .unwrap_or_else(|| gtk4::pango::FontDescription::from_string("Sans 24"));
+                    let color = s.text_color;
+                    s.annotations.push(image_ops::TextAnnotation {
+                        x: dx,
+                        y: dy,
+                        text,
+                        font_desc,
+                        color,
+                    });
+                }
+            } else {
+                s.draft_text.clear();
+            }
+            drop(s);
+            draft_entry.set_text("");
+            text_popover.popdown();
+            canvas.queue_draw();
+        }
+    });
+
+    // 7. set_text_mode
+    let set_text_mode: Rc<dyn Fn(bool)> = Rc::new({
+        let state = state.clone();
+        let canvas = canvas.clone();
+        let text_tool_bar = text_tool_bar.clone();
+        let edit_group = edit_group.clone();
+        let commit_draft = commit_draft.clone();
+        move |active: bool| {
+            if !active {
+                commit_draft();
+                state.borrow_mut().selected_ann = None;
+            }
+            state.borrow_mut().text_tool_active = active;
+            text_tool_bar.set_visible(active);
+            edit_group.set_sensitive(!active);
+            canvas.queue_draw();
+        }
+    });
+
+    // ── Text tool: click to place / select ───────────────────────────────────
+
+    let text_click = gtk4::GestureClick::new();
+    text_click.connect_released({
+        let state = state.clone();
+        let canvas = canvas.clone();
+        let text_popover = text_popover.clone();
+        let draft_entry = draft_entry.clone();
+        let commit_draft = commit_draft.clone();
+        let set_text_mode = set_text_mode.clone();
+        let font_btn = font_btn.clone();
+        let color_btn = color_btn.clone();
+        move |g, n, x, y| {
+            let (active, has_image, fit_mode, img_w, img_h) = {
+                let s = state.borrow();
+                (s.text_tool_active, s.image.is_some(), s.fit_mode, s.img_width, s.img_height)
+            };
+            if !has_image {
+                g.set_state(gtk4::EventSequenceState::Denied);
+                return;
+            }
+            // Any click on an annotation re-enters text mode (even after Done)
+            if !active {
+                let has_hit = {
+                    let vw = canvas.width() as f64;
+                    let vh = canvas.height() as f64;
+                    let s = state.borrow();
+                    let (ox, oy, scale) = if s.fit_mode {
+                        image_ops::fit_transform(s.img_width, s.img_height, vw, vh)
+                    } else {
+                        (0.0, 0.0, s.zoom)
+                    };
+                    hit_test_annotation(&s.annotations, x, y, ox, oy, scale).is_some()
+                };
+                if has_hit {
+                    set_text_mode(true);
+                } else {
+                    g.set_state(gtk4::EventSequenceState::Denied);
+                    return;
+                }
+            }
+            let vw = canvas.width() as f64;
+            let vh = canvas.height() as f64;
+            let (ox, oy, scale) = if fit_mode {
+                image_ops::fit_transform(img_w, img_h, vw, vh)
+            } else {
+                (0.0, 0.0, state.borrow().zoom)
+            };
+            // Hit-test existing annotations
+            let hit = {
+                let s = state.borrow();
+                hit_test_annotation(&s.annotations, x, y, ox, oy, scale)
+            };
+            if let Some(idx) = hit {
+                commit_draft();
+                if n >= 2 {
+                    // Double-click → unpack annotation into draft mode for editing
+                    let (ann_x, ann_y, ann_text) = {
+                        let s = state.borrow();
+                        let ann = &s.annotations[idx];
+                        (ann.x, ann.y, ann.text.clone())
+                    };
+                    {
+                        let mut s = state.borrow_mut();
+                        s.annotations.remove(idx);
+                        s.draft_pos = Some((ann_x, ann_y));
+                        s.draft_text = ann_text.clone();
+                        s.selected_ann = None;
+                    }
+                    // Pre-fill entry; select all so typing immediately replaces
+                    draft_entry.set_text(&ann_text);
+                    draft_entry.select_region(0, -1);
+                    let sx = (ox + ann_x * scale) as i32;
+                    let sy = (oy + ann_y * scale) as i32;
+                    // Defer popup — on Wayland, the previous popdown must be
+                    // fully dispatched before a new popup surface can be created.
+                    let pop = text_popover.clone();
+                    let ent = draft_entry.clone();
+                    glib::idle_add_local_once(move || {
+                        pop.set_pointing_to(Some(&gdk::Rectangle::new(sx, sy, 1, 1)));
+                        pop.popup();
+                        ent.grab_focus();
+                    });
+                } else {
+                    // Single click → select for dragging, sync toolbar to annotation's style
+                    let (ann_font, ann_color) = {
+                        let s = state.borrow();
+                        let ann = &s.annotations[idx];
+                        (ann.font_desc.clone(), ann.color)
+                    };
+                    state.borrow_mut().selected_ann = Some(idx);
+                    font_btn.set_font_desc(&ann_font);
+                    color_btn.set_rgba(&gdk::RGBA::new(
+                        ann_color.0 as f32,
+                        ann_color.1 as f32,
+                        ann_color.2 as f32,
+                        ann_color.3 as f32,
+                    ));
+                }
+                canvas.queue_draw();
+                return;
+            }
+            // No annotation hit → commit any draft and start a new one here
+            commit_draft();
+            let img_x = (x - ox) / scale;
+            let img_y = (y - oy) / scale;
+            {
+                let mut s = state.borrow_mut();
+                s.draft_pos = Some((img_x, img_y));
+                s.draft_text.clear();
+                s.selected_ann = None;
+            }
+            draft_entry.set_text("");
+            // Defer popup for the same Wayland reason
+            let xi = x as i32;
+            let yi = y as i32;
+            let pop = text_popover.clone();
+            let ent = draft_entry.clone();
+            glib::idle_add_local_once(move || {
+                pop.set_pointing_to(Some(&gdk::Rectangle::new(xi, yi, 1, 1)));
+                pop.popup();
+                ent.grab_focus();
+            });
+            canvas.queue_draw();
+        }
+    });
+    canvas.add_controller(text_click);
+
+    // ── Text tool: drag to move a selected annotation ─────────────────────────
+
+    let text_drag = gtk4::GestureDrag::new();
+    text_drag.set_exclusive(true);
+    text_drag.connect_drag_begin({
+        let state = state.clone();
+        let canvas = canvas.clone();
+        move |g, x, y| {
+            // Extract everything we need then release the borrow before set_state,
+            // because set_state can synchronously fire drag_end which borrows state.
+            let (active, fit_mode, img_w, img_h, zoom, hit) = {
+                let s = state.borrow();
+                let vw = canvas.width() as f64;
+                let vh = canvas.height() as f64;
+                let (ox, oy, scale) = if s.fit_mode {
+                    image_ops::fit_transform(s.img_width, s.img_height, vw, vh)
+                } else {
+                    (0.0, 0.0, s.zoom)
+                };
+                let hit = hit_test_annotation(&s.annotations, x, y, ox, oy, scale)
+                    .map(|idx| (idx, s.annotations[idx].x, s.annotations[idx].y));
+                (s.text_tool_active, s.fit_mode, s.img_width, s.img_height, s.zoom, hit)
+            };
+            let _ = (fit_mode, img_w, img_h, zoom); // suppress unused warnings
+            if !active {
+                g.set_state(gtk4::EventSequenceState::Denied);
+                return;
+            }
+            if let Some((idx, orig_x, orig_y)) = hit {
+                let mut s = state.borrow_mut();
+                s.selected_ann = Some(idx);
+                s.move_origin = Some((orig_x, orig_y));
+                drop(s);
+                canvas.queue_draw();
+            } else {
+                g.set_state(gtk4::EventSequenceState::Denied);
+            }
+        }
+    });
+    text_drag.connect_drag_update({
+        let state = state.clone();
+        let canvas = canvas.clone();
+        move |_g, dx, dy| {
+            let s = state.borrow();
+            if !s.text_tool_active { return; }
+            let (_, _, scale) = if s.fit_mode {
+                image_ops::fit_transform(s.img_width, s.img_height,
+                    canvas.width() as f64, canvas.height() as f64)
+            } else { (0.0, 0.0, s.zoom) };
+            if let (Some(idx), Some((ox, oy))) = (s.selected_ann, s.move_origin) {
+                let nx = ox + dx / scale;
+                let ny = oy + dy / scale;
+                drop(s);
+                let mut s = state.borrow_mut();
+                s.annotations[idx].x = nx;
+                s.annotations[idx].y = ny;
+                drop(s);
+                canvas.queue_draw();
+            }
+        }
+    });
+    text_drag.connect_drag_end({
+        let state = state.clone();
+        move |_, _, _| {
+            state.borrow_mut().move_origin = None;
+        }
+    });
+    canvas.add_controller(text_drag);
+
     // ── Crop gesture ──────────────────────────────────────────────────────────
 
     let drag = gtk4::GestureDrag::new();
+    drag.set_exclusive(true);
 
     drag.connect_drag_begin({
         let state = state.clone();
@@ -790,6 +1151,85 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         move |_| set_crop_mode(false)
     });
 
+    text_btn.connect_clicked({
+        let set_text_mode = set_text_mode.clone();
+        move |_| set_text_mode(true)
+    });
+    done_text_btn.connect_clicked({
+        let set_text_mode = set_text_mode.clone();
+        move |_| set_text_mode(false)
+    });
+
+    draft_entry.connect_changed({
+        let state = state.clone();
+        let canvas = canvas.clone();
+        move |entry| {
+            state.borrow_mut().draft_text = entry.text().to_string();
+            canvas.queue_draw();
+        }
+    });
+    draft_entry.connect_activate({
+        let commit_draft = commit_draft.clone();
+        move |_| commit_draft()
+    });
+    // Escape cancels the draft without committing
+    let esc_ctrl = gtk4::EventControllerKey::new();
+    esc_ctrl.connect_key_pressed({
+        let state = state.clone();
+        let canvas = canvas.clone();
+        let text_popover = text_popover.clone();
+        let draft_entry = draft_entry.clone();
+        move |_, keyval, _, _| {
+            if keyval == gdk::Key::Escape {
+                let mut s = state.borrow_mut();
+                s.draft_pos = None;
+                s.draft_text.clear();
+                drop(s);
+                draft_entry.set_text("");
+                text_popover.popdown();
+                canvas.queue_draw();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        }
+    });
+    draft_entry.add_controller(esc_ctrl);
+
+    font_btn.connect_font_desc_notify({
+        let state = state.clone();
+        let canvas = canvas.clone();
+        move |btn| {
+            let mut s = state.borrow_mut();
+            s.text_font_desc = btn.font_desc();
+            if let Some(idx) = s.selected_ann {
+                if let Some(ann) = s.annotations.get_mut(idx) {
+                    if let Some(fd) = btn.font_desc() {
+                        ann.font_desc = fd;
+                    }
+                }
+                drop(s);
+                canvas.queue_draw();
+            }
+        }
+    });
+    color_btn.connect_rgba_notify({
+        let state = state.clone();
+        let canvas = canvas.clone();
+        move |btn| {
+            let c = btn.rgba();
+            let color = (c.red() as f64, c.green() as f64, c.blue() as f64, c.alpha() as f64);
+            let mut s = state.borrow_mut();
+            s.text_color = color;
+            if let Some(idx) = s.selected_ann {
+                if let Some(ann) = s.annotations.get_mut(idx) {
+                    ann.color = color;
+                }
+                drop(s);
+                canvas.queue_draw();
+            }
+        }
+    });
+
     apply_crop_btn.connect_clicked({
         let state = state.clone();
         let canvas = canvas.clone();
@@ -943,12 +1383,17 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         let state = state.clone();
         let window = window.clone();
         move |_, _| {
-            let (img, path) = {
+            let (img, annotations, path) = {
                 let s = state.borrow();
-                (s.image.as_ref().map(|i| i.clone()), s.file_path.clone())
+                (
+                    s.image.as_ref().map(|i| i.clone()),
+                    s.annotations.clone(),
+                    s.file_path.clone(),
+                )
             };
             if let (Some(img), Some(path)) = (img, path) {
-                if let Err(e) = image_ops::save_image(&img, &path) {
+                let flat = image_ops::flatten_annotations(&img, &annotations);
+                if let Err(e) = image_ops::save_image(&flat, &path) {
                     show_error(&window, "Save failed", &e.to_string());
                 }
             }
@@ -961,9 +1406,13 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         let state = state.clone();
         let window = window.clone();
         move |_, _| {
-            let (img, current_path) = {
+            let (img, annotations, current_path) = {
                 let s = state.borrow();
-                (s.image.as_ref().map(|i| i.clone()), s.file_path.clone())
+                (
+                    s.image.as_ref().map(|i| i.clone()),
+                    s.annotations.clone(),
+                    s.file_path.clone(),
+                )
             };
             if img.is_none() { return; }
             let img = img.unwrap();
@@ -971,11 +1420,13 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
             let window = window.clone();
             let window2 = window.clone();
             show_save_dialog(&window, current_path.as_deref(), None, move |path| {
-                if let Err(e) = image_ops::save_image(&img, &path) {
+                let flat = image_ops::flatten_annotations(&img, &annotations);
+                if let Err(e) = image_ops::save_image(&flat, &path) {
                     show_error(&window2, "Save failed", &e.to_string());
                     return;
                 }
-                let name = path.file_name()
+                let name = path
+                    .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 window2.set_title(Some(&format!("{} — Preview", name)));
@@ -990,17 +1441,24 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         let state = state.clone();
         let window = window.clone();
         act.connect_activate(move |_, _| {
-            let img = state.borrow().image.as_ref().map(|i| i.clone());
+            let (img, annotations, current_path) = {
+                let s = state.borrow();
+                (
+                    s.image.as_ref().map(|i| i.clone()),
+                    s.annotations.clone(),
+                    s.file_path.clone(),
+                )
+            };
             if img.is_none() { return; }
             let img = img.unwrap();
-            let current_path = state.borrow().file_path.clone();
             // Suggest filename with new extension
             let suggested = current_path.as_deref().and_then(|p| p.file_stem())
                 .map(|s| format!("{}.{}", s.to_string_lossy(), ext));
             let window = window.clone();
             let window2 = window.clone();
             show_save_dialog(&window, None, suggested.as_deref(), move |path| {
-                if let Err(e) = image_ops::save_image(&img, &path) {
+                let flat = image_ops::flatten_annotations(&img, &annotations);
+                if let Err(e) = image_ops::save_image(&flat, &path) {
                     show_error(&window2, "Export failed", &e.to_string());
                 }
             });
@@ -1263,6 +1721,39 @@ fn gdk_texture_to_cairo(texture: &gdk::Texture) -> Option<cairo::ImageSurface> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Returns the index of the topmost annotation whose text bounding box contains (wx, wy)
+/// in widget (viewport) coordinates.
+///
+/// Pango lays text out *downward* from the anchor: the anchor (ann.x, ann.y) is the
+/// top-left of the first line, so the hit box runs from sy to sy + approx_h.
+fn hit_test_annotation(
+    annotations: &[image_ops::TextAnnotation],
+    wx: f64,
+    wy: f64,
+    ox: f64,
+    oy: f64,
+    scale: f64,
+) -> Option<usize> {
+    // Iterate in reverse so the last-drawn (topmost) annotation wins
+    for (i, ann) in annotations.iter().enumerate().rev() {
+        let sx = ox + ann.x * scale;
+        let sy = oy + ann.y * scale;
+        // Approximate text height in screen pixels from the font size stored in the descriptor
+        let font_pt = ann.font_desc.size() as f64 / gtk4::pango::SCALE as f64;
+        let approx_h = (font_pt * scale * 1.4).max(20.0);
+        // Approximate width: very rough, but generous enough for a usable hit area
+        let approx_w = (ann.text.len() as f64 * font_pt * scale * 0.7).max(30.0);
+        if wx >= sx - 4.0
+            && wx <= sx + approx_w + 4.0
+            && wy >= sy - 4.0
+            && wy <= sy + approx_h + 4.0
+        {
+            return Some(i);
+        }
+    }
+    None
+}
 
 fn linked_box(buttons: &[&gtk4::Widget]) -> gtk4::Box {
     let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
