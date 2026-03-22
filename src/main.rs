@@ -39,7 +39,8 @@ struct State {
     text_color: (f64, f64, f64, f64),
     text_rotation: f64,  // radians
     // Draft annotation being typed (image-space coords)
-    draft_pos: Option<(f64, f64)>,
+    draft_pos: Option<(f64, f64)>,    // top-left of text (updated each keystroke)
+    draft_center: Option<(f64, f64)>, // fixed visual centre (set at click/re-edit)
     draft_text: String,
     // Selected annotation index (for drag-to-move)
     selected_ann: Option<usize>,
@@ -49,6 +50,8 @@ struct State {
     rotation_drag_anchor: (f64, f64),    // text centre in widget space
     rotation_drag_begin: (f64, f64),     // widget pos where drag started
     rotation_drag_initial_rotation: f64,
+    // Copy/paste clipboard
+    clipboard: Option<image_ops::TextAnnotation>,
 }
 
 impl State {
@@ -391,7 +394,6 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
                     let pad = 4.0 / scale;
                     let handle_r = 5.0 / scale;
                     cr.save().unwrap();
-                    // Centre-based rotated space (matches draw_text_annotation)
                     cr.translate(ann.x + half_w, ann.y + half_h);
                     cr.rotate(ann.rotation);
                     let bx = -half_w - pad;
@@ -447,15 +449,18 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
                         .unwrap_or(s.draft_text.len()) as i32;
                     let rect = layout.index_to_pos(byte_idx);
                     let cursor_x = rect.x() as f64 / gtk4::pango::SCALE as f64;
-                    let (_, ph) = layout.pixel_size();
+                    let (tw, ph) = layout.pixel_size();
+                    let half_w = tw as f64 / 2.0;
+                    let half_h = ph as f64 / 2.0;
                     let (r, g, b, a) = s.text_color;
                     cr.set_source_rgba(r, g, b, a);
                     cr.set_line_width(2.0 / scale);
                     cr.save().unwrap();
-                    cr.translate(dx, dy);
+                    // Rotate around text centre (dx/dy is top-left)
+                    cr.translate(dx + half_w, dy + half_h);
                     cr.rotate(s.text_rotation);
-                    cr.move_to(cursor_x, 0.0);
-                    cr.line_to(cursor_x, ph as f64);
+                    cr.move_to(-half_w + cursor_x, -half_h);
+                    cr.line_to(-half_w + cursor_x, half_h);
                     cr.stroke().unwrap();
                     cr.restore().unwrap();
                 }
@@ -829,6 +834,7 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         move || {
             stop_blink();
             let mut s = state.borrow_mut();
+            s.draft_center = None;
             if let Some((dx, dy)) = s.draft_pos.take() {
                 let text = std::mem::take(&mut s.draft_text);
                 if !text.is_empty() {
@@ -940,10 +946,24 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
                         let ann = &s.annotations[idx];
                         (ann.x, ann.y, ann.text.clone())
                     };
+                    // Compute the fixed visual centre of the existing annotation
+                    let (ann_cx, ann_cy) = {
+                        let pc = canvas.pango_context();
+                        let layout = gtk4::pango::Layout::new(&pc);
+                        let s = state.borrow();
+                        let fd = s.annotations[idx].font_desc.clone();
+                        drop(s);
+                        layout.set_font_description(Some(&fd));
+                        layout.set_text(&ann_text);
+                        let (tw, th) = layout.pixel_size();
+                        (ann_x + tw as f64 / scale / 2.0,
+                         ann_y + th as f64 / scale / 2.0)
+                    };
                     {
                         let mut s = state.borrow_mut();
                         s.annotations.remove(idx);
                         s.draft_pos = Some((ann_x, ann_y));
+                        s.draft_center = Some((ann_cx, ann_cy));
                         s.draft_text = ann_text.clone();
                         s.selected_ann = None;
                     }
@@ -993,6 +1013,7 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
             {
                 let mut s = state.borrow_mut();
                 s.draft_pos = Some((img_x, img_y));
+                s.draft_center = Some((img_x, img_y)); // fixed visual centre
                 s.draft_text.clear();
                 s.selected_ann = None;
                 s.text_rotation = 0.0;
@@ -1360,15 +1381,22 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
                 (fd, sc)
             };
             state.borrow_mut().draft_text = text.clone();
-            // Resize entry to cover the actual rendered text area
+            // Measure current text; update draft_pos so the visual centre stays fixed
+            let pc = canvas.pango_context();
+            let layout = gtk4::pango::Layout::new(&pc);
+            layout.set_font_description(Some(&font_desc));
+            layout.set_text(&text);
+            let (pw, ph) = layout.pixel_size();
             if !text.is_empty() {
-                let pc = canvas.pango_context();
-                let layout = gtk4::pango::Layout::new(&pc);
-                layout.set_font_description(Some(&font_desc));
-                layout.set_text(&text);
-                let (pw, ph) = layout.pixel_size();
                 entry.set_width_request((pw as f64 * scale).ceil() as i32 + 4);
                 entry.set_height_request((ph as f64 * scale).ceil() as i32 + 4);
+            }
+            // Keep the visual centre pinned as text grows/shrinks
+            let draft_center = state.borrow().draft_center;
+            if let Some((cx, cy)) = draft_center {
+                let half_w = pw as f64 / scale / 2.0;
+                let half_h = ph as f64 / scale / 2.0;
+                state.borrow_mut().draft_pos = Some((cx - half_w, cy - half_h));
             }
             canvas.queue_draw();
         }
@@ -1398,6 +1426,7 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
                 stop_blink();
                 let mut s = state.borrow_mut();
                 s.draft_pos = None;
+                s.draft_center = None;
                 s.draft_text.clear();
                 drop(s);
                 draft_entry.set_text("");
@@ -1409,6 +1438,62 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         }
     });
     draft_entry.add_controller(esc_ctrl);
+
+    // Delete / Ctrl+C / Ctrl+V for selected annotations (when not in draft mode)
+    let ann_key_ctrl = gtk4::EventControllerKey::new();
+    ann_key_ctrl.connect_key_pressed({
+        let state = state.clone();
+        let canvas = canvas.clone();
+        let draft_entry = draft_entry.clone();
+        move |_, keyval, _, modifiers| {
+            // Only act when the text tool is active and we're not mid-edit
+            let s = state.borrow();
+            if !s.text_tool_active || gtk4::prelude::WidgetExt::is_visible(&draft_entry) {
+                return glib::Propagation::Proceed;
+            }
+            let ctrl = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
+            let selected = s.selected_ann;
+            drop(s);
+
+            match (keyval, ctrl) {
+                // Delete selected annotation
+                (gdk::Key::Delete, false) | (gdk::Key::KP_Delete, false) => {
+                    let mut s = state.borrow_mut();
+                    if let Some(idx) = selected {
+                        s.annotations.remove(idx);
+                        s.selected_ann = None;
+                    }
+                    drop(s);
+                    canvas.queue_draw();
+                    glib::Propagation::Stop
+                }
+                // Ctrl+C — copy selected annotation
+                (gdk::Key::c, true) | (gdk::Key::C, true) => {
+                    let mut s = state.borrow_mut();
+                    if let Some(idx) = selected {
+                        s.clipboard = s.annotations.get(idx).cloned();
+                    }
+                    glib::Propagation::Stop
+                }
+                // Ctrl+V — paste with +10x +10y offset (accumulates per paste)
+                (gdk::Key::v, true) | (gdk::Key::V, true) => {
+                    let mut s = state.borrow_mut();
+                    if let Some(ref mut cb) = s.clipboard {
+                        cb.x += 10.0;
+                        cb.y += 10.0;
+                        let ann = cb.clone();
+                        s.annotations.push(ann);
+                        s.selected_ann = Some(s.annotations.len() - 1);
+                        drop(s);
+                        canvas.queue_draw();
+                    }
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        }
+    });
+    window.add_controller(ann_key_ctrl);
 
     font_btn.connect_font_desc_notify({
         let state = state.clone();
@@ -1970,7 +2055,6 @@ fn hit_test_annotation(
         layout.set_font_description(Some(&ann.font_desc));
         layout.set_text(&ann.text);
         let (tw, th) = layout.pixel_size();
-        // Centre of text in widget coords
         let cx = ox + ann.x * scale + tw as f64 / 2.0;
         let cy = oy + ann.y * scale + th as f64 / 2.0;
         let dx = (wx - cx) / scale;
@@ -2004,7 +2088,6 @@ fn hit_test_rotation_handle(
     layout.set_font_description(Some(&ann.font_desc));
     layout.set_text(&ann.text);
     let (tw, th) = layout.pixel_size();
-    // Centre of text in widget coords
     let cx = ox + ann.x * scale + tw as f64 / 2.0;
     let cy = oy + ann.y * scale + th as f64 / 2.0;
     let dx = (wx - cx) / scale;
