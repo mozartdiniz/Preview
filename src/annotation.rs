@@ -1,8 +1,9 @@
 use gtk4::cairo;
+use gtk4::gdk;
 use gtk4::pango;
+use gtk4::prelude::{TextureExt, TextureExtManual};
 
-use image::{DynamicImage, imageops::FilterType};
-use std::path::Path;
+use image::DynamicImage;
 
 // ── Text annotation ───────────────────────────────────────────────────────────
 
@@ -112,93 +113,33 @@ pub fn to_cairo_surface(img: &DynamicImage) -> cairo::ImageSurface {
     .expect("cairo surface creation failed")
 }
 
-// ── Resize ────────────────────────────────────────────────────────────────────
+// ── GDK texture → Cairo surface (for display-only formats like SVG) ───────────
 
-pub fn resize(img: &DynamicImage, w: u32, h: u32) -> DynamicImage {
-    img.resize_exact(w, h, FilterType::Lanczos3)
-}
-
-// ── Rotate ────────────────────────────────────────────────────────────────────
-
-pub fn rotate_cw(img: &DynamicImage) -> DynamicImage {
-    img.rotate90()
-}
-
-pub fn rotate_ccw(img: &DynamicImage) -> DynamicImage {
-    img.rotate270()
-}
-
-// ── Flip ─────────────────────────────────────────────────────────────────────
-
-pub fn flip_h(img: &DynamicImage) -> DynamicImage {
-    img.fliph()
-}
-
-pub fn flip_v(img: &DynamicImage) -> DynamicImage {
-    img.flipv()
-}
-
-// ── Crop ─────────────────────────────────────────────────────────────────────
-
-pub fn crop(img: &DynamicImage, x: u32, y: u32, w: u32, h: u32) -> Option<DynamicImage> {
-    let iw = img.width();
-    let ih = img.height();
-    let x = x.min(iw.saturating_sub(1));
-    let y = y.min(ih.saturating_sub(1));
-    let w = w.min(iw - x);
-    let h = h.min(ih - y);
-    if w == 0 || h == 0 {
-        return None;
+pub fn gdk_texture_to_cairo(texture: &gdk::Texture) -> Option<cairo::ImageSurface> {
+    let w = texture.width();
+    let h = texture.height();
+    let stride = (w * 4) as usize;
+    // download() gives RGBA straight-alpha
+    let mut rgba = vec![0u8; stride * h as usize];
+    texture.download(&mut rgba, stride);
+    // Convert to premultiplied BGRA (cairo ARgb32 on little-endian)
+    let mut bgra: Vec<u8> = Vec::with_capacity(rgba.len());
+    for chunk in rgba.chunks_exact(4) {
+        let r = chunk[0] as u32;
+        let g = chunk[1] as u32;
+        let b = chunk[2] as u32;
+        let a = chunk[3] as u32;
+        bgra.push(((b * a + 127) / 255) as u8);
+        bgra.push(((g * a + 127) / 255) as u8);
+        bgra.push(((r * a + 127) / 255) as u8);
+        bgra.push(a as u8);
     }
-    Some(img.crop_imm(x, y, w, h))
-}
-
-// ── Save / Export ─────────────────────────────────────────────────────────────
-
-pub fn save_image(img: &DynamicImage, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let ext = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    match ext.as_str() {
-        "jpg" | "jpeg" => {
-            use image::codecs::jpeg::JpegEncoder;
-            let file = std::fs::File::create(path)?;
-            let encoder = JpegEncoder::new_with_quality(std::io::BufWriter::new(file), 92);
-            img.write_with_encoder(encoder)?;
-        }
-        _ => {
-            img.save(path)?;
-        }
-    }
-    Ok(())
-}
-
-// ── Coordinate helpers ────────────────────────────────────────────────────────
-
-/// Returns (offset_x, offset_y, scale) for contain-fit of img inside viewport.
-pub fn fit_transform(img_w: i32, img_h: i32, vp_w: f64, vp_h: f64) -> (f64, f64, f64) {
-    let iw = img_w as f64;
-    let ih = img_h as f64;
-    let scale = (vp_w / iw).min(vp_h / ih);
-    let ox = (vp_w - iw * scale) / 2.0;
-    let oy = (vp_h - ih * scale) / 2.0;
-    (ox, oy, scale)
-}
-
-/// Widget coordinate → image pixel coordinate (clamped).
-pub fn widget_to_img(
-    wx: f64,
-    wy: f64,
-    img_w: i32,
-    img_h: i32,
-    ox: f64,
-    oy: f64,
-    scale: f64,
-) -> (u32, u32) {
-    let ix = ((wx - ox) / scale).round().clamp(0.0, img_w as f64) as u32;
-    let iy = ((wy - oy) / scale).round().clamp(0.0, img_h as f64) as u32;
-    (ix, iy)
+    cairo::ImageSurface::create_for_data(
+        bgra,
+        cairo::Format::ARgb32,
+        w,
+        h,
+        stride as i32,
+    )
+    .ok()
 }
