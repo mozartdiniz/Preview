@@ -47,7 +47,9 @@ pub fn connect(w: &Widgets, state: Rc<RefCell<State>>, c: &Closures) {
         let state = state.clone();
         let window = w.window.clone();
         let update_image = c.update_image.clone();
+        let set_text_mode = c.set_text_mode.clone();
         move |_| {
+            set_text_mode(false);
             let (iw, ih) = { let s = state.borrow(); (s.img_width as u32, s.img_height as u32) };
             let state = state.clone(); let update_image = update_image.clone();
             dialogs::show_resize_dialog(&window, iw, ih, move |nw, nh| {
@@ -59,28 +61,36 @@ pub fn connect(w: &Widgets, state: Rc<RefCell<State>>, c: &Closures) {
 
     w.rotate_cw_btn.connect_clicked({
         let state = state.clone(); let update_image = c.update_image.clone();
+        let set_text_mode = c.set_text_mode.clone();
         move |_| {
+            set_text_mode(false);
             let img = state.borrow().image.as_ref().map(|i| i.clone());
             if let Some(img) = img { update_image(transforms::rotate_cw(&img)); }
         }
     });
     w.rotate_ccw_btn.connect_clicked({
         let state = state.clone(); let update_image = c.update_image.clone();
+        let set_text_mode = c.set_text_mode.clone();
         move |_| {
+            set_text_mode(false);
             let img = state.borrow().image.as_ref().map(|i| i.clone());
             if let Some(img) = img { update_image(transforms::rotate_ccw(&img)); }
         }
     });
     w.flip_h_btn.connect_clicked({
         let state = state.clone(); let update_image = c.update_image.clone();
+        let set_text_mode = c.set_text_mode.clone();
         move |_| {
+            set_text_mode(false);
             let img = state.borrow().image.as_ref().map(|i| i.clone());
             if let Some(img) = img { update_image(transforms::flip_h(&img)); }
         }
     });
     w.flip_v_btn.connect_clicked({
         let state = state.clone(); let update_image = c.update_image.clone();
+        let set_text_mode = c.set_text_mode.clone();
         move |_| {
+            set_text_mode(false);
             let img = state.borrow().image.as_ref().map(|i| i.clone());
             if let Some(img) = img { update_image(transforms::flip_v(&img)); }
         }

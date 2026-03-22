@@ -135,7 +135,7 @@ pub fn build(app: &adw::Application) -> Widgets {
     let flip_v_btn = gtk4::Button::builder()
         .icon_name("object-flip-vertical-symbolic").tooltip_text("Flip Vertical").sensitive(false).build();
     let crop_btn = gtk4::Button::builder()
-        .icon_name("transform-crop-symbolic").tooltip_text("Crop Image").sensitive(false).build();
+        .icon_name("edit-cut-symbolic").tooltip_text("Crop Image").sensitive(false).build();
     let text_btn = gtk4::Button::builder()
         .icon_name("insert-text-symbolic").tooltip_text("Add Text Annotation").sensitive(false).build();
     let edit_group = linked_box(&[

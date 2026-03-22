@@ -60,6 +60,7 @@ pub fn make_update_image(
             let mut s = state.borrow_mut();
             s.img_width = iw; s.img_height = ih;
             s.surface = Some(surface); s.image = Some(img); s.annotations.clear();
+            s.draft_pos = None; s.draft_center = None; s.draft_text.clear(); s.selected_ann = None;
         }
         for btn in &[
             resize_btn.upcast_ref::<gtk4::Widget>(), rotate_ccw_btn.upcast_ref(),

@@ -168,7 +168,9 @@ pub fn connect(
         let state = state.clone(); let canvas = canvas.clone();
         let update_image = c.update_image.clone();
         let set_crop_mode = c.set_crop_mode.clone();
+        let set_text_mode = c.set_text_mode.clone();
         move |_| {
+            set_text_mode(false);
             let (crop_rect, img) = {
                 let s = state.borrow();
                 let vw = canvas.width() as f64; let vh = canvas.height() as f64;
