@@ -161,6 +161,8 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
     // ── Inline text entry (overlaid directly on the canvas) ──────────────────
     // Opacity 0: completely invisible (including focus ring) but still
     // focusable — all visual feedback comes from the canvas preview.
+    // can_target=false: pointer/drag events always fall through to the canvas
+    // so rotation handles and other gestures keep working.
     let draft_entry = gtk4::Entry::builder()
         .placeholder_text("Type and press Enter…")
         .width_request(1)
@@ -169,6 +171,7 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         .valign(gtk4::Align::Start)
         .visible(false)
         .opacity(0.0)
+        .can_target(false)
         .build();
 
     // ── Text annotation toolbar ───────────────────────────────────────────────
@@ -1025,7 +1028,7 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
             canvas.queue_draw();
         }
     });
-    canvas.add_controller(text_click);
+    canvas_overlay.add_controller(text_click);
 
     // ── Text tool: drag to move a selected annotation ─────────────────────────
 
@@ -1162,7 +1165,7 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
             s.pivot_drag = false;
         }
     });
-    canvas.add_controller(text_drag);
+    canvas_overlay.add_controller(text_drag);
 
     // ── Crop gesture ──────────────────────────────────────────────────────────
 
