@@ -17,23 +17,23 @@ pub struct TextAnnotation {
     pub color: (f64, f64, f64, f64),
     /// Rotation in radians, clockwise.
     pub rotation: f64,
-    /// Rotation pivot offset from (x, y) in image-pixel coordinates.
-    pub pivot_dx: f64,
-    pub pivot_dy: f64,
 }
 
 /// Draw a single annotation onto the given Cairo context.
 /// The context must already be in image-space (scaled/translated by the caller).
+/// Rotation is always around the centre of the text bounding box.
 pub fn draw_text_annotation(cr: &cairo::Context, ann: &TextAnnotation) {
     let layout = pangocairo::functions::create_layout(cr);
     layout.set_font_description(Some(&ann.font_desc));
     layout.set_text(&ann.text);
+    let (tw, th) = layout.pixel_size();
+    let half_w = tw as f64 / 2.0;
+    let half_h = th as f64 / 2.0;
     cr.set_source_rgba(ann.color.0, ann.color.1, ann.color.2, ann.color.3);
     cr.save().unwrap();
-    // Translate to pivot point, rotate, then draw text offset from pivot
-    cr.translate(ann.x + ann.pivot_dx, ann.y + ann.pivot_dy);
+    cr.translate(ann.x + half_w, ann.y + half_h);
     cr.rotate(ann.rotation);
-    cr.move_to(-ann.pivot_dx, -ann.pivot_dy);
+    cr.move_to(-half_w, -half_h);
     pangocairo::functions::show_layout(cr, &layout);
     cr.restore().unwrap();
 }
