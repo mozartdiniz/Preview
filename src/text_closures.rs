@@ -77,8 +77,11 @@ pub fn make_commit_draft(
 ) -> Rc<dyn Fn()> {
     let canvas = w.canvas.clone();
     let draft_entry = w.draft_entry.clone();
+    let undo_btn = w.undo_btn.clone();
     Rc::new(move || {
         stop_blink();
+        let will_commit = { let s = state.borrow(); s.draft_pos.is_some() && !s.draft_text.is_empty() };
+        if will_commit { state.borrow_mut().push_undo(); undo_btn.set_sensitive(true); }
         let mut s = state.borrow_mut();
         s.draft_center = None;
         if let Some((dx, dy)) = s.draft_pos.take() {
@@ -111,7 +114,10 @@ pub fn make_set_text_mode(
     Rc::new(move |active: bool| {
         if !active {
             commit_draft();
-            state.borrow_mut().selected_ann = None;
+            let mut s = state.borrow_mut();
+            s.selected_ann = None;
+            s.property_undo_pushed = false;
+            drop(s);
         }
         state.borrow_mut().text_tool_active = active;
         text_tool_bar.set_visible(active);

@@ -5,6 +5,17 @@ use std::path::PathBuf;
 
 use crate::annotation::TextAnnotation;
 
+// ── History ───────────────────────────────────────────────────────────────────
+
+const MAX_UNDO: usize = 20;
+
+pub struct HistoryEntry {
+    pub image: Option<DynamicImage>,
+    pub img_width: i32,
+    pub img_height: i32,
+    pub annotations: Vec<TextAnnotation>,
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -44,6 +55,14 @@ pub struct State {
     pub rotation_drag_initial_rotation: f64,
     // Copy/paste clipboard
     pub clipboard: Option<TextAnnotation>,
+    // Undo/redo history
+    pub undo_stack: Vec<HistoryEntry>,
+    pub redo_stack: Vec<HistoryEntry>,
+    // Suppress undo/annotation updates during programmatic UI sync and rotation drags
+    pub syncing_ui: bool,
+    // True once undo has been pushed for the current annotation property-edit session;
+    // reset whenever a different annotation is selected or text mode is deactivated.
+    pub property_undo_pushed: bool,
 }
 
 impl State {
@@ -58,5 +77,18 @@ impl State {
 
     pub fn has_image(&self) -> bool {
         self.img_width > 0
+    }
+
+    pub fn push_undo(&mut self) {
+        self.undo_stack.push(HistoryEntry {
+            image: self.image.clone(),
+            img_width: self.img_width,
+            img_height: self.img_height,
+            annotations: self.annotations.clone(),
+        });
+        if self.undo_stack.len() > MAX_UNDO {
+            self.undo_stack.remove(0);
+        }
+        self.redo_stack.clear();
     }
 }

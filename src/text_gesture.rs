@@ -21,6 +21,7 @@ pub fn setup_text_click(
     let font_btn = w.font_btn.clone();
     let color_btn = w.color_btn.clone();
     let rotation_spin = w.rotation_spin.clone();
+    let undo_btn_click = w.undo_btn.clone();
 
     let text_click = gtk4::GestureClick::new();
     text_click.connect_released({
@@ -31,6 +32,7 @@ pub fn setup_text_click(
         let set_text_mode = set_text_mode.clone();
         let start_blink = start_blink.clone();
         let draft_cursor_pos = draft_cursor_pos.clone();
+        let undo_btn = undo_btn_click.clone();
         move |g, n, x, y| {
             let (active, has_image, fit_mode, img_w, img_h) = {
                 let s = state.borrow();
@@ -74,6 +76,8 @@ pub fn setup_text_click(
                         (ann_x + tw as f64 / scale / 2.0, ann_y + th as f64 / scale / 2.0)
                     };
                     {
+                        state.borrow_mut().push_undo();
+                        undo_btn.set_sensitive(true);
                         let mut s = state.borrow_mut();
                         s.annotations.remove(idx);
                         s.draft_pos = Some((ann_x, ann_y));
@@ -99,12 +103,18 @@ pub fn setup_text_click(
                         let ann = &s.annotations[idx];
                         (ann.font_desc.clone(), ann.color, ann.rotation)
                     };
-                    state.borrow_mut().selected_ann = Some(idx);
+                    {
+                        let mut s = state.borrow_mut();
+                        if s.selected_ann != Some(idx) { s.property_undo_pushed = false; }
+                        s.syncing_ui = true;
+                        s.selected_ann = Some(idx);
+                    }
                     font_btn.set_font_desc(&ann_font);
                     color_btn.set_rgba(&gdk::RGBA::new(
                         ann_color.0 as f32, ann_color.1 as f32, ann_color.2 as f32, ann_color.3 as f32,
                     ));
                     rotation_spin.set_value(ann_rotation.to_degrees());
+                    state.borrow_mut().syncing_ui = false;
                 }
                 canvas.queue_draw();
                 return;
@@ -137,6 +147,7 @@ pub fn setup_text_click(
 pub fn setup_text_drag(w: &Widgets, state: Rc<RefCell<State>>) {
     let canvas = w.canvas.clone();
     let rotation_spin = w.rotation_spin.clone();
+    let undo_btn = w.undo_btn.clone();
 
     let text_drag = gtk4::GestureDrag::new();
     text_drag.set_exclusive(true);
@@ -174,7 +185,10 @@ pub fn setup_text_drag(w: &Widgets, state: Rc<RefCell<State>>) {
             };
             if !active { g.set_state(gtk4::EventSequenceState::Denied); return; }
             if let Some((idx, orig_x, orig_y, anchor_wx, anchor_wy, init_rot)) = hit {
+                state.borrow_mut().push_undo();
+                undo_btn.set_sensitive(true);
                 let mut s = state.borrow_mut();
+                if s.selected_ann != Some(idx) { s.property_undo_pushed = false; }
                 s.selected_ann = Some(idx);
                 match drag_mode {
                     DragMode::Rotate => {

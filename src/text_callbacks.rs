@@ -17,6 +17,7 @@ pub fn connect(
 ) {
     let canvas = w.canvas.clone();
     let draft_entry = w.draft_entry.clone();
+    let undo_btn = w.undo_btn.clone();
 
     draft_entry.connect_changed({
         let state = state.clone(); let canvas = canvas.clone();
@@ -88,6 +89,7 @@ pub fn connect(
     ann_key_ctrl.connect_key_pressed({
         let state = state.clone(); let canvas = canvas.clone();
         let draft_entry = draft_entry.clone();
+        let undo_btn = undo_btn.clone();
         move |_, keyval, _, modifiers| {
             let s = state.borrow();
             if !s.text_tool_active || gtk4::prelude::WidgetExt::is_visible(&draft_entry) {
@@ -98,8 +100,12 @@ pub fn connect(
             match (keyval, ctrl) {
                 (gdk::Key::Delete, false) | (gdk::Key::KP_Delete, false) => {
                     let mut s = state.borrow_mut();
-                    if let Some(idx) = selected { s.annotations.remove(idx); s.selected_ann = None; }
-                    drop(s); canvas.queue_draw(); glib::Propagation::Stop
+                    if let Some(idx) = selected {
+                        s.push_undo();
+                        s.annotations.remove(idx); s.selected_ann = None;
+                        drop(s); undo_btn.set_sensitive(true);
+                    }
+                    canvas.queue_draw(); glib::Propagation::Stop
                 }
                 (gdk::Key::c, true) | (gdk::Key::C, true) => {
                     let mut s = state.borrow_mut();
@@ -108,12 +114,15 @@ pub fn connect(
                 }
                 (gdk::Key::v, true) | (gdk::Key::V, true) => {
                     let mut s = state.borrow_mut();
-                    if let Some(ref mut cb) = s.clipboard {
-                        cb.x += 10.0; cb.y += 10.0;
-                        let ann = cb.clone();
-                        s.annotations.push(ann);
-                        s.selected_ann = Some(s.annotations.len() - 1);
-                        drop(s); canvas.queue_draw();
+                    if s.clipboard.is_some() {
+                        s.push_undo();
+                        if let Some(ref mut cb) = s.clipboard {
+                            cb.x += 10.0; cb.y += 10.0;
+                            let ann = cb.clone();
+                            s.annotations.push(ann);
+                            s.selected_ann = Some(s.annotations.len() - 1);
+                        }
+                        drop(s); undo_btn.set_sensitive(true); canvas.queue_draw();
                     }
                     glib::Propagation::Stop
                 }
@@ -125,7 +134,16 @@ pub fn connect(
 
     w.font_btn.connect_font_desc_notify({
         let state = state.clone(); let canvas = canvas.clone();
+        let undo_btn = undo_btn.clone();
         move |btn| {
+            let pushed = {
+                let mut s = state.borrow_mut();
+                if s.syncing_ui { return; }
+                let p = s.selected_ann.is_some() && !s.property_undo_pushed;
+                if p { s.push_undo(); s.property_undo_pushed = true; }
+                p
+            };
+            if pushed { undo_btn.set_sensitive(true); }
             let mut s = state.borrow_mut();
             s.text_font_desc = btn.font_desc();
             if let Some(idx) = s.selected_ann {
@@ -139,9 +157,18 @@ pub fn connect(
 
     w.color_btn.connect_rgba_notify({
         let state = state.clone(); let canvas = canvas.clone();
+        let undo_btn = undo_btn.clone();
         move |btn| {
             let c = btn.rgba();
             let color = (c.red() as f64, c.green() as f64, c.blue() as f64, c.alpha() as f64);
+            let pushed = {
+                let mut s = state.borrow_mut();
+                if s.syncing_ui { return; }
+                let p = s.selected_ann.is_some() && !s.property_undo_pushed;
+                if p { s.push_undo(); s.property_undo_pushed = true; }
+                p
+            };
+            if pushed { undo_btn.set_sensitive(true); }
             let mut s = state.borrow_mut();
             s.text_color = color;
             if let Some(idx) = s.selected_ann {
@@ -153,8 +180,17 @@ pub fn connect(
 
     w.rotation_spin.connect_value_changed({
         let state = state.clone(); let canvas = canvas.clone();
+        let undo_btn = undo_btn.clone();
         move |spin| {
             let rad = spin.value().to_radians();
+            let pushed = {
+                let mut s = state.borrow_mut();
+                if s.syncing_ui || s.rotation_drag { return; }
+                let p = s.selected_ann.is_some() && !s.property_undo_pushed;
+                if p { s.push_undo(); s.property_undo_pushed = true; }
+                p
+            };
+            if pushed { undo_btn.set_sensitive(true); }
             let mut s = state.borrow_mut();
             s.text_rotation = rad;
             if let Some(idx) = s.selected_ann {

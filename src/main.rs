@@ -36,6 +36,8 @@ pub struct Closures {
     pub stop_blink: Rc<dyn Fn()>,
     pub commit_draft: Rc<dyn Fn()>,
     pub set_text_mode: Rc<dyn Fn(bool)>,
+    pub undo: Rc<dyn Fn()>,
+    pub redo: Rc<dyn Fn()>,
 }
 
 fn main() -> glib::ExitCode {
@@ -71,10 +73,13 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
     let (start_blink, stop_blink) = text_closures::make_blink_handlers(w.canvas.clone(), cursor_blink_on.clone(), blink_source);
     let commit_draft = text_closures::make_commit_draft(&w, state.clone(), stop_blink.clone());
     let set_text_mode = text_closures::make_set_text_mode(&w, state.clone(), commit_draft.clone());
+    let undo = image_closures::make_undo(&w, state.clone(), apply_zoom.clone());
+    let redo = image_closures::make_redo(&w, state.clone(), apply_zoom.clone());
 
     let c = Closures {
         apply_zoom, update_image, load_image_file, show_open_dialog,
         set_crop_mode, start_blink, stop_blink, commit_draft, set_text_mode,
+        undo, redo,
     };
 
     text_gesture::setup_text_click(&w, state.clone(), c.commit_draft.clone(), c.set_text_mode.clone(), c.start_blink.clone(), draft_cursor_pos.clone());

@@ -53,10 +53,13 @@ pub fn make_update_image(
     let text_btn = w.text_btn.clone();
     let zoom_fit_btn = w.zoom_fit_btn.clone();
     let zoom_orig_btn = w.zoom_orig_btn.clone();
+    let undo_btn = w.undo_btn.clone();
     Rc::new(move |img: DynamicImage| {
         let surface = annotation::to_cairo_surface(&img);
         let (iw, ih) = (img.width() as i32, img.height() as i32);
         {
+            state.borrow_mut().push_undo();
+            undo_btn.set_sensitive(true);
             let mut s = state.borrow_mut();
             s.img_width = iw; s.img_height = ih;
             s.surface = Some(surface); s.image = Some(img); s.annotations.clear();
@@ -106,6 +109,7 @@ pub fn make_load_image_file(
                 window.set_title(Some(&format!("{} — Preview", name)));
                 { let mut s = state.borrow_mut(); s.zoom = 1.0; s.fit_mode = true; s.file_path = Some(path.to_path_buf()); }
                 update_image(img);
+                { let mut s = state.borrow_mut(); s.undo_stack.clear(); s.redo_stack.clear(); }
             }
             Err(_) => {
                 let file = gio::File::for_path(path);
@@ -120,6 +124,7 @@ pub fn make_load_image_file(
                             s.file_path = Some(path.to_path_buf()); s.annotations.clear();
                         }
                         window.set_title(Some(&format!("{} — Preview", name)));
+                        { let mut s = state.borrow_mut(); s.undo_stack.clear(); s.redo_stack.clear(); }
                         status_label.set_markup(&format!(
                             "<b>{}</b>  {}×{} px  (display only)",
                             glib::markup_escape_text(&name), tw, th
@@ -167,5 +172,80 @@ pub fn make_show_open_dialog(
                 if let Some(path) = file.path() { load_image_file(&path); }
             }
         });
+    })
+}
+
+pub fn make_undo(
+    w: &Widgets,
+    state: Rc<RefCell<State>>,
+    apply_zoom: Rc<dyn Fn()>,
+) -> Rc<dyn Fn()> {
+    let status_label = w.status_label.clone();
+    let window = w.window.clone();
+    let undo_btn = w.undo_btn.clone();
+    Rc::new(move || {
+        let mut s = state.borrow_mut();
+        let Some(entry) = s.undo_stack.pop() else { return };
+        let stack_empty = s.undo_stack.is_empty();
+        let current = crate::state::HistoryEntry {
+            image: s.image.clone(),
+            img_width: s.img_width,
+            img_height: s.img_height,
+            annotations: s.annotations.clone(),
+        };
+        s.redo_stack.push(current);
+        if let Some(img) = &entry.image {
+            s.surface = Some(annotation::to_cairo_surface(img));
+        }
+        s.image = entry.image;
+        s.img_width = entry.img_width;
+        s.img_height = entry.img_height;
+        s.annotations = entry.annotations;
+        s.draft_pos = None; s.draft_center = None; s.draft_text.clear();
+        s.selected_ann = None; s.property_undo_pushed = false;
+        let (iw, ih) = (s.img_width, s.img_height);
+        drop(s);
+        undo_btn.set_sensitive(!stack_empty);
+        let title = window.title().unwrap_or_default();
+        let name = title.trim_end_matches(" — Preview").to_string();
+        status_label.set_markup(&format!("<b>{}</b>  {}×{} px", glib::markup_escape_text(&name), iw, ih));
+        apply_zoom();
+    })
+}
+
+pub fn make_redo(
+    w: &Widgets,
+    state: Rc<RefCell<State>>,
+    apply_zoom: Rc<dyn Fn()>,
+) -> Rc<dyn Fn()> {
+    let status_label = w.status_label.clone();
+    let window = w.window.clone();
+    let undo_btn = w.undo_btn.clone();
+    Rc::new(move || {
+        let mut s = state.borrow_mut();
+        let Some(entry) = s.redo_stack.pop() else { return };
+        let current = crate::state::HistoryEntry {
+            image: s.image.clone(),
+            img_width: s.img_width,
+            img_height: s.img_height,
+            annotations: s.annotations.clone(),
+        };
+        s.undo_stack.push(current);
+        if let Some(img) = &entry.image {
+            s.surface = Some(annotation::to_cairo_surface(img));
+        }
+        s.image = entry.image;
+        s.img_width = entry.img_width;
+        s.img_height = entry.img_height;
+        s.annotations = entry.annotations;
+        s.draft_pos = None; s.draft_center = None; s.draft_text.clear();
+        s.selected_ann = None; s.property_undo_pushed = false;
+        let (iw, ih) = (s.img_width, s.img_height);
+        drop(s);
+        undo_btn.set_sensitive(true);
+        let title = window.title().unwrap_or_default();
+        let name = title.trim_end_matches(" — Preview").to_string();
+        status_label.set_markup(&format!("<b>{}</b>  {}×{} px", glib::markup_escape_text(&name), iw, ih));
+        apply_zoom();
     })
 }

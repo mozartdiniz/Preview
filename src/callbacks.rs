@@ -96,6 +96,11 @@ pub fn connect(w: &Widgets, state: Rc<RefCell<State>>, c: &Closures) {
         }
     });
 
+    w.undo_btn.connect_clicked({
+        let undo = c.undo.clone();
+        move |_| undo()
+    });
+
     w.crop_btn.connect_clicked({
         let set_crop_mode = c.set_crop_mode.clone();
         move |_| set_crop_mode(true)

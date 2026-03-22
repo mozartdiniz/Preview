@@ -21,6 +21,7 @@ pub struct Widgets {
     pub done_text_btn: gtk4::Button,
     pub edit_group: gtk4::Box,
     pub open_btn: gtk4::Button,
+    pub undo_btn: gtk4::Button,
     pub zoom_out_btn: gtk4::Button,
     pub zoom_fit_btn: gtk4::Button,
     pub zoom_orig_btn: gtk4::Button,
@@ -112,6 +113,8 @@ pub fn build(app: &adw::Application) -> Widgets {
 
     let open_btn = gtk4::Button::builder()
         .icon_name("document-open-symbolic").tooltip_text("Open Image (Ctrl+O)").build();
+    let undo_btn = gtk4::Button::builder()
+        .icon_name("edit-undo-symbolic").tooltip_text("Undo (Ctrl+Z)").sensitive(false).build();
     let zoom_out_btn = gtk4::Button::builder()
         .icon_name("zoom-out-symbolic").tooltip_text("Zoom Out  (–)").sensitive(false).build();
     let zoom_fit_btn = gtk4::Button::builder()
@@ -162,6 +165,7 @@ pub fn build(app: &adw::Application) -> Widgets {
 
     let header = adw::HeaderBar::new();
     header.pack_start(&open_btn);
+    header.pack_start(&undo_btn);
     header.pack_end(&save_btn);
     header.pack_end(&zoom_group);
     header.pack_end(&edit_group);
@@ -190,7 +194,7 @@ pub fn build(app: &adw::Application) -> Widgets {
         status_label, zoom_label,
         cancel_crop_btn, apply_crop_btn, crop_bar,
         draft_entry, font_btn, color_btn, rotation_spin, text_tool_bar, done_text_btn,
-        edit_group, open_btn, zoom_out_btn, zoom_fit_btn, zoom_orig_btn, zoom_in_btn,
+        edit_group, open_btn, undo_btn, zoom_out_btn, zoom_fit_btn, zoom_orig_btn, zoom_in_btn,
         resize_btn, rotate_ccw_btn, rotate_cw_btn, flip_h_btn, flip_v_btn,
         crop_btn, text_btn, save_btn,
     }

@@ -143,6 +143,19 @@ pub fn setup(w: &Widgets, state: Rc<RefCell<State>>, c: &Closures) {
     app.set_accels_for_action("win.save-as",   &["<Ctrl><Shift>s"]);
     app.set_accels_for_action("app.quit",      &["<Ctrl>q"]);
 
+    let act_undo = gio::SimpleAction::new("undo", None);
+    act_undo.connect_activate({ let undo = c.undo.clone(); move |_, _| undo() });
+
+    let act_redo = gio::SimpleAction::new("redo", None);
+    act_redo.connect_activate({ let redo = c.redo.clone(); move |_, _| redo() });
+
+    for a in &[act_undo.upcast_ref::<gio::Action>(), act_redo.upcast_ref()] {
+        window.add_action(*a);
+    }
+
+    app.set_accels_for_action("win.undo", &["<Ctrl>z"]);
+    app.set_accels_for_action("win.redo", &["<Ctrl>y", "<Ctrl><Shift>z"]);
+
     let act_quit = gio::SimpleAction::new("quit", None);
     act_quit.connect_activate({ let app = app.clone(); move |_, _| app.quit() });
     app.add_action(&act_quit);
