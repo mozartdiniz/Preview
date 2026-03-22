@@ -105,7 +105,9 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         .hexpand(true)
         .vexpand(true)
         .build();
-    scrolled.set_child(Some(&canvas));
+    let canvas_overlay = gtk4::Overlay::new();
+    canvas_overlay.set_child(Some(&canvas));
+    scrolled.set_child(Some(&canvas_overlay));
 
     // ── Status bar ────────────────────────────────────────────────────────────
     let status_label = gtk4::Label::builder()
@@ -156,15 +158,18 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
     crop_bar.append(&crop_hint);
     crop_bar.append(&apply_crop_btn);
 
-    // ── Inline text entry popover (anchored to canvas, shown on click) ────────
+    // ── Inline text entry (overlaid directly on the canvas) ──────────────────
+    // Opacity 0: completely invisible (including focus ring) but still
+    // focusable — all visual feedback comes from the canvas preview.
     let draft_entry = gtk4::Entry::builder()
         .placeholder_text("Type and press Enter…")
-        .width_request(240)
+        .width_request(1)
+        .height_request(1)
+        .halign(gtk4::Align::Start)
+        .valign(gtk4::Align::Start)
+        .visible(false)
+        .opacity(0.0)
         .build();
-    let text_popover = gtk4::Popover::new();
-    text_popover.set_child(Some(&draft_entry));
-    text_popover.set_has_arrow(true);
-    text_popover.set_autohide(false);
 
     // ── Text annotation toolbar ───────────────────────────────────────────────
     let font_dialog = gtk4::FontDialog::new();
@@ -332,8 +337,13 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         .content(&toolbar_view)
         .build();
 
-    // Attach the draft-text popover to the canvas now that the widget tree exists
-    text_popover.set_parent(&canvas);
+    // Add inline text entry as overlay on the canvas
+    canvas_overlay.add_overlay(&draft_entry);
+
+    // Blinking cursor state — shared between the blink timer and the draw func
+    let cursor_blink_on = Rc::new(Cell::new(false));
+    // Cursor character position within the draft text (mirrors entry's cursor-position)
+    let draft_cursor_pos: Rc<Cell<i32>> = Rc::new(Cell::new(0));
 
     // ── Canvas draw function ──────────────────────────────────────────────────
     //
@@ -343,6 +353,8 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
     //   zoom mode → cr.scale(zoom); content_width/height drive scrollbars
     canvas.set_draw_func({
         let state = state.clone();
+        let cursor_blink_on = cursor_blink_on.clone();
+        let draft_cursor_pos = draft_cursor_pos.clone();
         move |_da, cr, width, height| {
             let s = state.borrow();
             let Some(ref surface) = s.surface else { return };
@@ -416,15 +428,14 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
             }
             // Draw draft annotation (live preview while typing)
             if let Some((dx, dy)) = s.draft_pos {
+                let font_desc = s.text_font_desc.clone()
+                    .unwrap_or_else(|| gtk4::pango::FontDescription::from_string("Sans 24"));
                 if !s.draft_text.is_empty() {
                     let preview = image_ops::TextAnnotation {
                         x: dx,
                         y: dy,
                         text: s.draft_text.clone(),
-                        font_desc: s
-                            .text_font_desc
-                            .clone()
-                            .unwrap_or_else(|| gtk4::pango::FontDescription::from_string("Sans 24")),
+                        font_desc: font_desc.clone(),
                         color: s.text_color,
                         rotation: s.text_rotation,
                         pivot_dx: 0.0,
@@ -432,11 +443,39 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
                     };
                     image_ops::draw_text_annotation(cr, &preview);
                 }
-                // Placement cursor dot
-                let dot = 4.0 / scale;
-                cr.set_source_rgba(1.0, 0.9, 0.0, 0.9);
-                cr.arc(dx, dy, dot, 0.0, std::f64::consts::TAU);
-                cr.fill().unwrap();
+                // Blinking text cursor at the entry's current cursor position
+                if cursor_blink_on.get() {
+                    let layout = pangocairo::functions::create_layout(cr);
+                    layout.set_font_description(Some(&font_desc));
+                    layout.set_text(&s.draft_text);
+                    // Convert character index → byte index for Pango
+                    let char_pos = draft_cursor_pos.get() as usize;
+                    let byte_idx = s.draft_text
+                        .char_indices()
+                        .nth(char_pos)
+                        .map(|(i, _)| i)
+                        .unwrap_or(s.draft_text.len()) as i32;
+                    let rect = layout.index_to_pos(byte_idx);
+                    let cursor_x = rect.x() as f64 / gtk4::pango::SCALE as f64;
+                    let (_, ph) = layout.pixel_size();
+                    let (r, g, b, a) = s.text_color;
+                    cr.set_source_rgba(r, g, b, a);
+                    cr.set_line_width(2.0 / scale);
+                    cr.save().unwrap();
+                    cr.translate(dx, dy);
+                    cr.rotate(s.text_rotation);
+                    cr.move_to(cursor_x, 0.0);
+                    cr.line_to(cursor_x, ph as f64);
+                    cr.stroke().unwrap();
+                    cr.restore().unwrap();
+                }
+                // Placement dot (shows anchor point when text is empty)
+                if s.draft_text.is_empty() {
+                    let dot = 4.0 / scale;
+                    cr.set_source_rgba(1.0, 0.9, 0.0, 0.9);
+                    cr.arc(dx, dy, dot, 0.0, std::f64::consts::TAU);
+                    cr.fill().unwrap();
+                }
             }
             cr.restore().unwrap();
 
@@ -756,13 +795,49 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         }
     });
 
+    // ── Blink timer helpers ───────────────────────────────────────────────────
+    let blink_source: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+
+    let start_blink: Rc<dyn Fn()> = Rc::new({
+        let cursor_blink_on = cursor_blink_on.clone();
+        let blink_source = blink_source.clone();
+        let canvas = canvas.clone();
+        move || {
+            if let Some(id) = blink_source.take() { id.remove(); }
+            cursor_blink_on.set(true);
+            canvas.queue_draw();
+            let id = glib::timeout_add_local(std::time::Duration::from_millis(530), {
+                let cursor_blink_on = cursor_blink_on.clone();
+                let canvas = canvas.clone();
+                move || {
+                    cursor_blink_on.set(!cursor_blink_on.get());
+                    canvas.queue_draw();
+                    glib::ControlFlow::Continue
+                }
+            });
+            blink_source.set(Some(id));
+        }
+    });
+
+    let stop_blink: Rc<dyn Fn()> = Rc::new({
+        let cursor_blink_on = cursor_blink_on.clone();
+        let blink_source = blink_source.clone();
+        let canvas = canvas.clone();
+        move || {
+            if let Some(id) = blink_source.take() { id.remove(); }
+            cursor_blink_on.set(false);
+            canvas.queue_draw();
+        }
+    });
+
     // 6. commit_draft — push any in-progress annotation to the list
     let commit_draft: Rc<dyn Fn()> = Rc::new({
         let state = state.clone();
         let canvas = canvas.clone();
-        let text_popover = text_popover.clone();
         let draft_entry = draft_entry.clone();
+        let stop_blink = stop_blink.clone();
         move || {
+            stop_blink();
             let mut s = state.borrow_mut();
             if let Some((dx, dy)) = s.draft_pos.take() {
                 let text = std::mem::take(&mut s.draft_text);
@@ -789,7 +864,7 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
             }
             drop(s);
             draft_entry.set_text("");
-            text_popover.popdown();
+            draft_entry.set_visible(false);
             canvas.queue_draw();
         }
     });
@@ -819,12 +894,13 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
     text_click.connect_released({
         let state = state.clone();
         let canvas = canvas.clone();
-        let text_popover = text_popover.clone();
         let draft_entry = draft_entry.clone();
         let commit_draft = commit_draft.clone();
         let set_text_mode = set_text_mode.clone();
         let font_btn = font_btn.clone();
         let color_btn = color_btn.clone();
+        let start_blink = start_blink.clone();
+        let draft_cursor_pos = draft_cursor_pos.clone();
         let rotation_spin = rotation_spin.clone();
         move |g, n, x, y| {
             let (active, has_image, fit_mode, img_w, img_h) = {
@@ -885,17 +961,22 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
                     }
                     // Pre-fill entry; select all so typing immediately replaces
                     draft_entry.set_text(&ann_text);
-                    draft_entry.select_region(0, -1);
                     let sx = (ox + ann_x * scale) as i32;
                     let sy = (oy + ann_y * scale) as i32;
-                    // Defer popup — on Wayland, the previous popdown must be
-                    // fully dispatched before a new popup surface can be created.
-                    let pop = text_popover.clone();
                     let ent = draft_entry.clone();
+                    let blink = start_blink.clone();
+                    let cpos = draft_cursor_pos.clone();
                     glib::idle_add_local_once(move || {
-                        pop.set_pointing_to(Some(&gdk::Rectangle::new(sx, sy, 1, 1)));
-                        pop.popup();
+                        ent.set_margin_start(sx);
+                        ent.set_margin_top(sy);
+                        ent.set_visible(true);
                         ent.grab_focus();
+                        // GTK auto-selects all on focus — clear it by placing
+                        // cursor at end with no selection.
+                        let end = ent.text().chars().count() as i32;
+                        ent.select_region(end, end);
+                        cpos.set(end);
+                        blink();
                     });
                 } else {
                     // Single click → select for dragging, sync toolbar to annotation's style
@@ -930,15 +1011,16 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
             }
             rotation_spin.set_value(0.0);
             draft_entry.set_text("");
-            // Defer popup for the same Wayland reason
-            let xi = x as i32;
-            let yi = y as i32;
-            let pop = text_popover.clone();
             let ent = draft_entry.clone();
+            let blink = start_blink.clone();
+            let cpos = draft_cursor_pos.clone();
             glib::idle_add_local_once(move || {
-                pop.set_pointing_to(Some(&gdk::Rectangle::new(xi, yi, 1, 1)));
-                pop.popup();
+                ent.set_margin_start(x as i32);
+                ent.set_margin_top(y as i32);
+                ent.set_visible(true);
                 ent.grab_focus();
+                cpos.set(ent.property::<i32>("cursor-position"));
+                blink();
             });
             canvas.queue_draw();
         }
@@ -1289,7 +1371,34 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         let state = state.clone();
         let canvas = canvas.clone();
         move |entry| {
-            state.borrow_mut().draft_text = entry.text().to_string();
+            let text = entry.text().to_string();
+            let (font_desc, scale) = {
+                let s = state.borrow_mut();
+                let fd = s.text_font_desc.clone()
+                    .unwrap_or_else(|| gtk4::pango::FontDescription::from_string("Sans 24"));
+                let sc = if s.fit_mode {
+                    let (_, _, sc) = image_ops::fit_transform(
+                        s.img_width, s.img_height,
+                        canvas.width() as f64, canvas.height() as f64,
+                    );
+                    sc
+                } else {
+                    s.zoom
+                };
+                drop(s);
+                (fd, sc)
+            };
+            state.borrow_mut().draft_text = text.clone();
+            // Resize entry to cover the actual rendered text area
+            if !text.is_empty() {
+                let pc = canvas.pango_context();
+                let layout = gtk4::pango::Layout::new(&pc);
+                layout.set_font_description(Some(&font_desc));
+                layout.set_text(&text);
+                let (pw, ph) = layout.pixel_size();
+                entry.set_width_request((pw as f64 * scale).ceil() as i32 + 4);
+                entry.set_height_request((ph as f64 * scale).ceil() as i32 + 4);
+            }
             canvas.queue_draw();
         }
     });
@@ -1297,21 +1406,31 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
         let commit_draft = commit_draft.clone();
         move |_| commit_draft()
     });
+    // Track cursor position so the canvas cursor follows arrow-key movement
+    draft_entry.connect_notify_local(Some("cursor-position"), {
+        let draft_cursor_pos = draft_cursor_pos.clone();
+        let start_blink = start_blink.clone();
+        move |entry, _| {
+            draft_cursor_pos.set(entry.property::<i32>("cursor-position"));
+            start_blink(); // restart blink so cursor is always visible after moving
+        }
+    });
     // Escape cancels the draft without committing
     let esc_ctrl = gtk4::EventControllerKey::new();
     esc_ctrl.connect_key_pressed({
         let state = state.clone();
         let canvas = canvas.clone();
-        let text_popover = text_popover.clone();
         let draft_entry = draft_entry.clone();
+        let stop_blink = stop_blink.clone();
         move |_, keyval, _, _| {
             if keyval == gdk::Key::Escape {
+                stop_blink();
                 let mut s = state.borrow_mut();
                 s.draft_pos = None;
                 s.draft_text.clear();
                 drop(s);
                 draft_entry.set_text("");
-                text_popover.popdown();
+                draft_entry.set_visible(false);
                 canvas.queue_draw();
                 return glib::Propagation::Stop;
             }
@@ -1366,9 +1485,9 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
                 if let Some(ann) = s.annotations.get_mut(idx) {
                     ann.rotation = rad;
                 }
-                drop(s);
-                canvas.queue_draw();
             }
+            drop(s);
+            canvas.queue_draw();
         }
     });
 
