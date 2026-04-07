@@ -11,6 +11,7 @@ mod image_closures;
 mod text_closures;
 mod text_gesture;
 mod crop_gesture;
+mod shape_gesture;
 mod callbacks;
 mod text_callbacks;
 mod actions;
@@ -22,6 +23,7 @@ use std::cell::{Cell, RefCell};
 use std::env;
 use std::rc::Rc;
 
+use crate::annotation::ShapeKind;
 use crate::state::State;
 
 const APP_ID: &str = "com.example.Preview";
@@ -36,6 +38,7 @@ pub struct Closures {
     pub stop_blink: Rc<dyn Fn()>,
     pub commit_draft: Rc<dyn Fn()>,
     pub set_text_mode: Rc<dyn Fn(bool)>,
+    pub set_shape_tool: Rc<dyn Fn(Option<ShapeKind>)>,
     pub undo: Rc<dyn Fn()>,
     pub redo: Rc<dyn Fn()>,
 }
@@ -73,18 +76,24 @@ fn build_ui(app: &adw::Application, initial_file: Option<&std::path::Path>) {
     let (start_blink, stop_blink) = text_closures::make_blink_handlers(w.canvas.clone(), cursor_blink_on.clone(), blink_source);
     let commit_draft = text_closures::make_commit_draft(&w, state.clone(), stop_blink.clone());
     let set_text_mode = text_closures::make_set_text_mode(&w, state.clone(), commit_draft.clone());
+    let set_shape_tool = text_closures::make_set_shape_tool(&w, state.clone(), commit_draft.clone());
     let undo = image_closures::make_undo(&w, state.clone(), apply_zoom.clone());
     let redo = image_closures::make_redo(&w, state.clone(), apply_zoom.clone());
 
     let c = Closures {
         apply_zoom, update_image, load_image_file, show_open_dialog,
-        set_crop_mode, start_blink, stop_blink, commit_draft, set_text_mode,
+        set_crop_mode, start_blink, stop_blink, commit_draft, set_text_mode, set_shape_tool,
         undo, redo,
     };
 
     text_gesture::setup_text_click(&w, state.clone(), c.commit_draft.clone(), c.set_text_mode.clone(), c.start_blink.clone(), draft_cursor_pos.clone());
     text_gesture::setup_text_drag(&w, state.clone());
     crop_gesture::setup(&w.canvas, state.clone(), w.apply_crop_btn.clone());
+    shape_gesture::setup_shape_click(
+        &w.canvas_overlay, &w.canvas, state.clone(),
+        c.set_shape_tool.clone(), w.shape_color_btn.clone(), w.shape_stroke_spin.clone(),
+    );
+    shape_gesture::setup_shape_drag(&w.canvas_overlay, &w.canvas, state.clone(), w.undo_btn.clone());
     callbacks::connect(&w, state.clone(), &c);
     text_callbacks::connect(&w, state.clone(), &c, draft_cursor_pos);
     actions::setup(&w, state.clone(), &c);

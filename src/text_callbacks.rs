@@ -92,6 +92,25 @@ pub fn connect(
         let undo_btn = undo_btn.clone();
         move |_, keyval, _, modifiers| {
             let s = state.borrow();
+            // Shape tool delete
+            if s.shape_tool_active && !gtk4::prelude::WidgetExt::is_visible(&draft_entry) {
+                let ctrl = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
+                let selected_shape = s.selected_shape; drop(s);
+                if matches!(keyval, gdk::Key::Delete | gdk::Key::KP_Delete | gdk::Key::BackSpace)
+                    && !ctrl
+                {
+                    let mut s = state.borrow_mut();
+                    if let Some(idx) = selected_shape {
+                        s.push_undo();
+                        s.shape_annotations.remove(idx);
+                        s.selected_shape = None;
+                        s.shape_property_undo_pushed = false;
+                        drop(s); undo_btn.set_sensitive(true);
+                    }
+                    canvas.queue_draw(); return glib::Propagation::Stop;
+                }
+                return glib::Propagation::Proceed;
+            }
             if !s.text_tool_active || gtk4::prelude::WidgetExt::is_visible(&draft_entry) {
                 return glib::Propagation::Proceed;
             }
@@ -197,6 +216,49 @@ pub fn connect(
                 if let Some(ann) = s.annotations.get_mut(idx) { ann.rotation = rad; }
             }
             drop(s); canvas.queue_draw();
+        }
+    });
+
+    w.shape_color_btn.connect_rgba_notify({
+        let state = state.clone(); let canvas = canvas.clone();
+        let undo_btn = undo_btn.clone();
+        move |btn| {
+            let c = btn.rgba();
+            let color = (c.red() as f64, c.green() as f64, c.blue() as f64, c.alpha() as f64);
+            let pushed = {
+                let mut s = state.borrow_mut();
+                let p = s.selected_shape.is_some() && !s.shape_property_undo_pushed;
+                if p { s.push_undo(); s.shape_property_undo_pushed = true; }
+                p
+            };
+            if pushed { undo_btn.set_sensitive(true); }
+            let mut s = state.borrow_mut();
+            s.shape_color = color;
+            if let Some(idx) = s.selected_shape {
+                if let Some(shape) = s.shape_annotations.get_mut(idx) { shape.color = color; }
+                drop(s); canvas.queue_draw();
+            }
+        }
+    });
+
+    w.shape_stroke_spin.connect_value_changed({
+        let state = state.clone(); let canvas = canvas.clone();
+        let undo_btn = undo_btn.clone();
+        move |spin| {
+            let stroke = spin.value();
+            let pushed = {
+                let mut s = state.borrow_mut();
+                let p = s.selected_shape.is_some() && !s.shape_property_undo_pushed;
+                if p { s.push_undo(); s.shape_property_undo_pushed = true; }
+                p
+            };
+            if pushed { undo_btn.set_sensitive(true); }
+            let mut s = state.borrow_mut();
+            s.shape_stroke_width = stroke;
+            if let Some(idx) = s.selected_shape {
+                if let Some(shape) = s.shape_annotations.get_mut(idx) { shape.stroke_width = stroke; }
+                drop(s); canvas.queue_draw();
+            }
         }
     });
 

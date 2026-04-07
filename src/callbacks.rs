@@ -3,6 +3,7 @@ use gtk4::{gdk, gio};
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::annotation::ShapeKind;
 use crate::dialogs;
 use crate::state::State;
 use crate::transforms;
@@ -118,9 +119,27 @@ pub fn connect(w: &Widgets, state: Rc<RefCell<State>>, c: &Closures) {
         move |_| set_text_mode(false)
     });
 
-    // Scroll-wheel zoom (Ctrl + scroll)
+    w.rect_btn.connect_clicked({
+        let set_shape_tool = c.set_shape_tool.clone();
+        move |_| set_shape_tool(Some(ShapeKind::Rect))
+    });
+    w.line_btn.connect_clicked({
+        let set_shape_tool = c.set_shape_tool.clone();
+        move |_| set_shape_tool(Some(ShapeKind::Line))
+    });
+    w.arrow_btn.connect_clicked({
+        let set_shape_tool = c.set_shape_tool.clone();
+        move |_| set_shape_tool(Some(ShapeKind::Arrow))
+    });
+    w.shape_done_btn.connect_clicked({
+        let set_shape_tool = c.set_shape_tool.clone();
+        move |_| set_shape_tool(None)
+    });
+
+    // Scroll-wheel zoom (Ctrl + scroll) — on canvas_overlay so the ScrolledWindow
+    // handles all native trackpad/horizontal events without interference.
     let scroll_ctrl = gtk4::EventControllerScroll::new(
-        gtk4::EventControllerScrollFlags::VERTICAL | gtk4::EventControllerScrollFlags::DISCRETE,
+        gtk4::EventControllerScrollFlags::VERTICAL | gtk4::EventControllerScrollFlags::HORIZONTAL,
     );
     scroll_ctrl.connect_scroll({
         let state = state.clone(); let apply_zoom = c.apply_zoom.clone();
@@ -137,7 +156,28 @@ pub fn connect(w: &Widgets, state: Rc<RefCell<State>>, c: &Closures) {
             glib::Propagation::Stop
         }
     });
-    w.scrolled.add_controller(scroll_ctrl);
+    w.canvas_overlay.add_controller(scroll_ctrl);
+
+    // Pinch-to-zoom
+    let pinch = gtk4::GestureZoom::new();
+    let pinch_start_zoom: Rc<RefCell<f64>> = Rc::new(RefCell::new(1.0));
+    pinch.connect_begin({
+        let state = state.clone();
+        let pinch_start_zoom = pinch_start_zoom.clone();
+        move |_, _| { *pinch_start_zoom.borrow_mut() = state.borrow().zoom; }
+    });
+    pinch.connect_scale_changed({
+        let state = state.clone(); let apply_zoom = c.apply_zoom.clone();
+        let pinch_start_zoom = pinch_start_zoom.clone();
+        move |_, scale| {
+            let mut s = state.borrow_mut();
+            if !s.has_image() { return; }
+            if s.fit_mode { s.fit_mode = false; }
+            s.zoom = (*pinch_start_zoom.borrow() * scale).clamp(0.05, 32.0);
+            drop(s); apply_zoom();
+        }
+    });
+    w.canvas_overlay.add_controller(pinch);
 
     // Drag-and-drop
     let drop_target = gtk4::DropTarget::new(gio::File::static_type(), gdk::DragAction::COPY);

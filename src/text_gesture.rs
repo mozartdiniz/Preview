@@ -34,11 +34,11 @@ pub fn setup_text_click(
         let draft_cursor_pos = draft_cursor_pos.clone();
         let undo_btn = undo_btn_click.clone();
         move |g, n, x, y| {
-            let (active, has_image, fit_mode, img_w, img_h) = {
+            let (active, has_image, fit_mode, img_w, img_h, shape_active) = {
                 let s = state.borrow();
-                (s.text_tool_active, s.image.is_some(), s.fit_mode, s.img_width, s.img_height)
+                (s.text_tool_active, s.image.is_some(), s.fit_mode, s.img_width, s.img_height, s.shape_tool_active)
             };
-            if !has_image { g.set_state(gtk4::EventSequenceState::Denied); return; }
+            if !has_image || shape_active { g.set_state(gtk4::EventSequenceState::Denied); return; }
             if !active {
                 let has_hit = {
                     let vw = canvas.width() as f64; let vh = canvas.height() as f64;
@@ -108,6 +108,7 @@ pub fn setup_text_click(
                         if s.selected_ann != Some(idx) { s.property_undo_pushed = false; }
                         s.syncing_ui = true;
                         s.selected_ann = Some(idx);
+                        s.selected_shape = None;
                     }
                     font_btn.set_font_desc(&ann_font);
                     color_btn.set_rgba(&gdk::RGBA::new(
@@ -117,6 +118,10 @@ pub fn setup_text_click(
                     state.borrow_mut().syncing_ui = false;
                 }
                 canvas.queue_draw();
+                return;
+            }
+            if state.borrow().text_drag_was_active {
+                state.borrow_mut().text_drag_was_active = false;
                 return;
             }
             commit_draft();
@@ -185,6 +190,7 @@ pub fn setup_text_drag(w: &Widgets, state: Rc<RefCell<State>>) {
             };
             if !active { g.set_state(gtk4::EventSequenceState::Denied); return; }
             if let Some((idx, orig_x, orig_y, anchor_wx, anchor_wy, init_rot)) = hit {
+                state.borrow_mut().text_drag_was_active = true;
                 state.borrow_mut().push_undo();
                 undo_btn.set_sensitive(true);
                 let mut s = state.borrow_mut();

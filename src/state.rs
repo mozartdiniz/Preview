@@ -3,7 +3,7 @@ use gtk4::pango;
 use image::DynamicImage;
 use std::path::PathBuf;
 
-use crate::annotation::TextAnnotation;
+use crate::annotation::{ShapeAnnotation, ShapeKind, TextAnnotation};
 
 // ── History ───────────────────────────────────────────────────────────────────
 
@@ -14,6 +14,7 @@ pub struct HistoryEntry {
     pub img_width: i32,
     pub img_height: i32,
     pub annotations: Vec<TextAnnotation>,
+    pub shape_annotations: Vec<ShapeAnnotation>,
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -53,11 +54,23 @@ pub struct State {
     pub rotation_drag_anchor: (f64, f64),    // text centre in widget space
     pub rotation_drag_begin: (f64, f64),     // widget pos where drag started
     pub rotation_drag_initial_rotation: f64,
+    // Shape annotation tool
+    pub shape_annotations: Vec<ShapeAnnotation>,
+    pub shape_tool_active: bool,
+    pub shape_kind: ShapeKind,
+    pub shape_draft: Option<(f64, f64, f64, f64)>,  // (x1,y1,x2,y2) image-space
+    pub shape_color: (f64, f64, f64, f64),
+    pub shape_stroke_width: f64,
+    pub selected_shape: Option<usize>,
+    pub shape_drag_was_active: bool,
+    pub shape_property_undo_pushed: bool,
     // Copy/paste clipboard
     pub clipboard: Option<TextAnnotation>,
     // Undo/redo history
     pub undo_stack: Vec<HistoryEntry>,
     pub redo_stack: Vec<HistoryEntry>,
+    // Set when a drag gesture (move/rotate) was active; suppresses spurious click-to-add-text
+    pub text_drag_was_active: bool,
     // Suppress undo/annotation updates during programmatic UI sync and rotation drags
     pub syncing_ui: bool,
     // True once undo has been pushed for the current annotation property-edit session;
@@ -71,6 +84,8 @@ impl State {
             zoom: 1.0,
             fit_mode: true,
             text_color: (1.0, 0.0, 0.0, 1.0),
+            shape_color: (1.0, 0.0, 0.0, 1.0),
+            shape_stroke_width: 2.0,
             ..Default::default()
         }
     }
@@ -85,6 +100,7 @@ impl State {
             img_width: self.img_width,
             img_height: self.img_height,
             annotations: self.annotations.clone(),
+            shape_annotations: self.shape_annotations.clone(),
         });
         if self.undo_stack.len() > MAX_UNDO {
             self.undo_stack.remove(0);

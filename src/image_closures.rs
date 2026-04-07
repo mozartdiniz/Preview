@@ -51,6 +51,9 @@ pub fn make_update_image(
     let flip_v_btn = w.flip_v_btn.clone();
     let crop_btn = w.crop_btn.clone();
     let text_btn = w.text_btn.clone();
+    let rect_btn = w.rect_btn.clone();
+    let line_btn = w.line_btn.clone();
+    let arrow_btn = w.arrow_btn.clone();
     let zoom_fit_btn = w.zoom_fit_btn.clone();
     let zoom_orig_btn = w.zoom_orig_btn.clone();
     let undo_btn = w.undo_btn.clone();
@@ -63,12 +66,14 @@ pub fn make_update_image(
             let mut s = state.borrow_mut();
             s.img_width = iw; s.img_height = ih;
             s.surface = Some(surface); s.image = Some(img); s.annotations.clear();
+            s.shape_annotations.clear();
             s.draft_pos = None; s.draft_center = None; s.draft_text.clear(); s.selected_ann = None;
         }
         for btn in &[
             resize_btn.upcast_ref::<gtk4::Widget>(), rotate_ccw_btn.upcast_ref(),
             rotate_cw_btn.upcast_ref(), flip_h_btn.upcast_ref(), flip_v_btn.upcast_ref(),
             crop_btn.upcast_ref(), text_btn.upcast_ref(),
+            rect_btn.upcast_ref(), line_btn.upcast_ref(), arrow_btn.upcast_ref(),
             zoom_fit_btn.upcast_ref(), zoom_orig_btn.upcast_ref(), save_btn.upcast_ref(),
         ] { btn.set_sensitive(true); }
         let title = window.title().unwrap_or_default();
@@ -101,6 +106,9 @@ pub fn make_load_image_file(
     let flip_v_btn = w.flip_v_btn.clone();
     let crop_btn = w.crop_btn.clone();
     let text_btn = w.text_btn.clone();
+    let rect_btn2 = w.rect_btn.clone();
+    let line_btn2 = w.line_btn.clone();
+    let arrow_btn2 = w.arrow_btn.clone();
     Rc::new(move |path: &std::path::Path| {
         let name = path.file_name()
             .map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -122,6 +130,7 @@ pub fn make_load_image_file(
                             s.surface = annotation::gdk_texture_to_cairo(&texture);
                             s.zoom = 1.0; s.fit_mode = true;
                             s.file_path = Some(path.to_path_buf()); s.annotations.clear();
+                            s.shape_annotations.clear();
                         }
                         window.set_title(Some(&format!("{} — Preview", name)));
                         { let mut s = state.borrow_mut(); s.undo_stack.clear(); s.redo_stack.clear(); }
@@ -136,6 +145,7 @@ pub fn make_load_image_file(
                             resize_btn.upcast_ref::<gtk4::Widget>(), rotate_ccw_btn.upcast_ref(),
                             rotate_cw_btn.upcast_ref(), flip_h_btn.upcast_ref(), flip_v_btn.upcast_ref(),
                             crop_btn.upcast_ref(), text_btn.upcast_ref(),
+                            rect_btn2.upcast_ref(), line_btn2.upcast_ref(), arrow_btn2.upcast_ref(),
                         ] { btn.set_sensitive(false); }
                         canvas.queue_draw();
                         apply_zoom();
@@ -192,6 +202,7 @@ pub fn make_undo(
             img_width: s.img_width,
             img_height: s.img_height,
             annotations: s.annotations.clone(),
+            shape_annotations: s.shape_annotations.clone(),
         };
         s.redo_stack.push(current);
         if let Some(img) = &entry.image {
@@ -201,8 +212,10 @@ pub fn make_undo(
         s.img_width = entry.img_width;
         s.img_height = entry.img_height;
         s.annotations = entry.annotations;
+        s.shape_annotations = entry.shape_annotations;
         s.draft_pos = None; s.draft_center = None; s.draft_text.clear();
         s.selected_ann = None; s.property_undo_pushed = false;
+        s.selected_shape = None; s.shape_property_undo_pushed = false;
         let (iw, ih) = (s.img_width, s.img_height);
         drop(s);
         undo_btn.set_sensitive(!stack_empty);
@@ -229,6 +242,7 @@ pub fn make_redo(
             img_width: s.img_width,
             img_height: s.img_height,
             annotations: s.annotations.clone(),
+            shape_annotations: s.shape_annotations.clone(),
         };
         s.undo_stack.push(current);
         if let Some(img) = &entry.image {
@@ -238,8 +252,10 @@ pub fn make_redo(
         s.img_width = entry.img_width;
         s.img_height = entry.img_height;
         s.annotations = entry.annotations;
+        s.shape_annotations = entry.shape_annotations;
         s.draft_pos = None; s.draft_center = None; s.draft_text.clear();
         s.selected_ann = None; s.property_undo_pushed = false;
+        s.selected_shape = None; s.shape_property_undo_pushed = false;
         let (iw, ih) = (s.img_width, s.img_height);
         drop(s);
         undo_btn.set_sensitive(true);

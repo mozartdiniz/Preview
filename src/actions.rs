@@ -66,12 +66,12 @@ pub fn setup(w: &Widgets, state: Rc<RefCell<State>>, c: &Closures) {
     act_save.connect_activate({
         let state = state.clone(); let window = window.clone();
         move |_, _| {
-            let (img, annotations, path) = {
+            let (img, annotations, shapes, path) = {
                 let s = state.borrow();
-                (s.image.as_ref().map(|i| i.clone()), s.annotations.clone(), s.file_path.clone())
+                (s.image.as_ref().map(|i| i.clone()), s.annotations.clone(), s.shape_annotations.clone(), s.file_path.clone())
             };
             if let (Some(img), Some(path)) = (img, path) {
-                let flat = annotation::flatten_annotations(&img, &annotations);
+                let flat = annotation::flatten_annotations(&img, &annotations, &shapes);
                 if let Err(e) = export::save_image(&flat, &path) {
                     dialogs::show_error(&window, "Save failed", &e.to_string());
                 }
@@ -83,14 +83,14 @@ pub fn setup(w: &Widgets, state: Rc<RefCell<State>>, c: &Closures) {
     act_save_as.connect_activate({
         let state = state.clone(); let window = window.clone();
         move |_, _| {
-            let (img, annotations, current_path) = {
+            let (img, annotations, shapes, current_path) = {
                 let s = state.borrow();
-                (s.image.as_ref().map(|i| i.clone()), s.annotations.clone(), s.file_path.clone())
+                (s.image.as_ref().map(|i| i.clone()), s.annotations.clone(), s.shape_annotations.clone(), s.file_path.clone())
             };
             let Some(img) = img else { return };
             let state = state.clone(); let window = window.clone(); let window2 = window.clone();
             dialogs::show_save_dialog(&window, current_path.as_deref(), None, move |path| {
-                let flat = annotation::flatten_annotations(&img, &annotations);
+                let flat = annotation::flatten_annotations(&img, &annotations, &shapes);
                 if let Err(e) = export::save_image(&flat, &path) {
                     dialogs::show_error(&window2, "Save failed", &e.to_string()); return;
                 }
@@ -105,16 +105,16 @@ pub fn setup(w: &Widgets, state: Rc<RefCell<State>>, c: &Closures) {
         let act = gio::SimpleAction::new(&format!("export-{}", ext), None);
         let state = state.clone(); let window = window.clone();
         act.connect_activate(move |_, _| {
-            let (img, annotations, current_path) = {
+            let (img, annotations, shapes, current_path) = {
                 let s = state.borrow();
-                (s.image.as_ref().map(|i| i.clone()), s.annotations.clone(), s.file_path.clone())
+                (s.image.as_ref().map(|i| i.clone()), s.annotations.clone(), s.shape_annotations.clone(), s.file_path.clone())
             };
             let Some(img) = img else { return };
             let suggested = current_path.as_deref().and_then(|p| p.file_stem())
                 .map(|s| format!("{}.{}", s.to_string_lossy(), ext));
             let window = window.clone(); let window2 = window.clone();
             dialogs::show_save_dialog(&window, None, suggested.as_deref(), move |path| {
-                let flat = annotation::flatten_annotations(&img, &annotations);
+                let flat = annotation::flatten_annotations(&img, &annotations, &shapes);
                 if let Err(e) = export::save_image(&flat, &path) {
                     dialogs::show_error(&window2, "Export failed", &e.to_string());
                 }

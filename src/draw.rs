@@ -39,6 +39,38 @@ pub fn setup(
             cr.source().set_filter(cairo::Filter::Bilinear);
             cr.paint().unwrap();
 
+            for (i, shape) in s.shape_annotations.iter().enumerate() {
+                annotation::draw_shape_annotation(cr, shape);
+                if s.shape_tool_active && s.selected_shape == Some(i) {
+                    let handle_r = 5.0 / scale;
+                    let pad = 1.5 / scale;
+                    cr.set_source_rgba(0.2, 0.6, 1.0, 0.9);
+                    cr.set_line_width(1.5 / scale);
+                    cr.set_dash(&[5.0 / scale, 4.0 / scale], 0.0);
+                    annotation::draw_shape_annotation(cr, shape);  // dashed blue overlay
+                    cr.set_dash(&[], 0.0);
+                    for (hx, hy) in [(shape.x1, shape.y1), (shape.x2, shape.y2)] {
+                        cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+                        cr.arc(hx, hy, handle_r + pad, 0.0, std::f64::consts::TAU);
+                        cr.fill().unwrap();
+                        cr.set_source_rgba(0.2, 0.6, 1.0, 0.9);
+                        cr.set_line_width(1.5 / scale);
+                        cr.arc(hx, hy, handle_r + pad, 0.0, std::f64::consts::TAU);
+                        cr.stroke().unwrap();
+                    }
+                }
+            }
+
+            if let Some((x1, y1, x2, y2)) = s.shape_draft {
+                let draft_shape = annotation::ShapeAnnotation {
+                    kind: s.shape_kind,
+                    x1, y1, x2, y2,
+                    color: s.shape_color,
+                    stroke_width: s.shape_stroke_width,
+                };
+                annotation::draw_shape_annotation(cr, &draft_shape);
+            }
+
             for (i, ann) in s.annotations.iter().enumerate() {
                 annotation::draw_text_annotation(cr, ann);
                 if s.text_tool_active && s.selected_ann == Some(i) {

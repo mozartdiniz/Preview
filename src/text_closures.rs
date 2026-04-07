@@ -1,9 +1,9 @@
 use gtk4::prelude::*;
-use gtk4::glib;
+use gtk4::{gdk, glib};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use crate::annotation;
+use crate::annotation::{self, ShapeKind};
 use crate::state::State;
 use crate::widgets::Widgets;
 
@@ -14,14 +14,19 @@ pub fn make_set_crop_mode(
 ) -> Rc<dyn Fn(bool)> {
     let canvas = w.canvas.clone();
     let crop_bar = w.crop_bar.clone();
+    let shape_tool_bar = w.shape_tool_bar.clone();
     let edit_group = w.edit_group.clone();
     let apply_crop_btn = w.apply_crop_btn.clone();
     Rc::new(move |active: bool| {
         {
             let mut s = state.borrow_mut();
             s.in_crop = active; s.drag_start = None; s.drag_end = None;
-            if active { s.fit_mode = true; }
+            if active {
+                s.fit_mode = true;
+                s.shape_tool_active = false; s.shape_draft = None;
+            }
         }
+        if active { shape_tool_bar.set_visible(false); }
         crop_bar.set_visible(active);
         edit_group.set_sensitive(!active);
         apply_crop_btn.set_sensitive(false);
@@ -110,6 +115,7 @@ pub fn make_set_text_mode(
 ) -> Rc<dyn Fn(bool)> {
     let canvas = w.canvas.clone();
     let text_tool_bar = w.text_tool_bar.clone();
+    let shape_tool_bar = w.shape_tool_bar.clone();
     let edit_group = w.edit_group.clone();
     Rc::new(move |active: bool| {
         if !active {
@@ -118,10 +124,70 @@ pub fn make_set_text_mode(
             s.selected_ann = None;
             s.property_undo_pushed = false;
             drop(s);
+        } else {
+            // Deactivate shape mode when entering text mode
+            let mut s = state.borrow_mut();
+            s.shape_tool_active = false; s.shape_draft = None;
+            s.selected_shape = None; s.shape_property_undo_pushed = false;
+            drop(s);
+            shape_tool_bar.set_visible(false);
         }
         state.borrow_mut().text_tool_active = active;
         text_tool_bar.set_visible(active);
         edit_group.set_sensitive(!active);
+        canvas.queue_draw();
+    })
+}
+
+pub fn make_set_shape_tool(
+    w: &Widgets,
+    state: Rc<RefCell<State>>,
+    commit_draft: Rc<dyn Fn()>,
+) -> Rc<dyn Fn(Option<ShapeKind>)> {
+    let canvas = w.canvas.clone();
+    let text_tool_bar = w.text_tool_bar.clone();
+    let shape_tool_bar = w.shape_tool_bar.clone();
+    let edit_group = w.edit_group.clone();
+    let shape_color_btn = w.shape_color_btn.clone();
+    let shape_stroke_spin = w.shape_stroke_spin.clone();
+    Rc::new(move |kind: Option<ShapeKind>| {
+        match kind {
+            Some(k) => {
+                // Deactivate text mode
+                commit_draft();
+                {
+                    let mut s = state.borrow_mut();
+                    s.text_tool_active = false;
+                    s.selected_ann = None;
+                    s.property_undo_pushed = false;
+                    s.shape_tool_active = true;
+                    s.shape_kind = k;
+                    s.shape_draft = None;
+                }
+                let (color, stroke) = {
+                    let s = state.borrow();
+                    (s.shape_color, s.shape_stroke_width)
+                };
+                text_tool_bar.set_visible(false);
+                shape_tool_bar.set_visible(true);
+                edit_group.set_sensitive(false);
+                shape_color_btn.set_rgba(&gdk::RGBA::new(
+                    color.0 as f32, color.1 as f32, color.2 as f32, color.3 as f32,
+                ));
+                shape_stroke_spin.set_value(stroke);
+            }
+            None => {
+                {
+                    let mut s = state.borrow_mut();
+                    s.shape_tool_active = false;
+                    s.shape_draft = None;
+                    s.selected_shape = None;
+                    s.shape_property_undo_pushed = false;
+                }
+                shape_tool_bar.set_visible(false);
+                edit_group.set_sensitive(true);
+            }
+        }
         canvas.queue_draw();
     })
 }

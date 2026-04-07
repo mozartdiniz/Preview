@@ -34,6 +34,14 @@ pub struct Widgets {
     pub crop_btn: gtk4::Button,
     pub text_btn: gtk4::Button,
     pub save_btn: gtk4::MenuButton,
+    // Shape tool
+    pub rect_btn: gtk4::Button,
+    pub line_btn: gtk4::Button,
+    pub arrow_btn: gtk4::Button,
+    pub shape_tool_bar: gtk4::Box,
+    pub shape_done_btn: gtk4::Button,
+    pub shape_color_btn: gtk4::ColorDialogButton,
+    pub shape_stroke_spin: gtk4::SpinButton,
 }
 
 fn linked_box(buttons: &[&gtk4::Widget]) -> gtk4::Box {
@@ -146,6 +154,38 @@ pub fn build(app: &adw::Application) -> Widgets {
         flip_h_btn.upcast_ref(), flip_v_btn.upcast_ref(), crop_btn.upcast_ref(), text_btn.upcast_ref(),
     ]);
 
+    let rect_btn = gtk4::Button::builder()
+        .label("Rect").tooltip_text("Draw Rectangle").sensitive(false).build();
+    let line_btn = gtk4::Button::builder()
+        .label("Line").tooltip_text("Draw Line").sensitive(false).build();
+    let arrow_btn = gtk4::Button::builder()
+        .label("Arrow").tooltip_text("Draw Arrow").sensitive(false).build();
+    let shapes_group = linked_box(&[
+        rect_btn.upcast_ref(), line_btn.upcast_ref(), arrow_btn.upcast_ref(),
+    ]);
+
+    let shape_done_btn = gtk4::Button::with_label("Done");
+    let shape_hint = gtk4::Label::builder()
+        .label("Drag on the image to draw — Ctrl+Z to undo")
+        .hexpand(true).halign(gtk4::Align::Center).build();
+    shape_hint.add_css_class("dim-label");
+    let shape_color_btn = gtk4::ColorDialogButton::new(Some(gtk4::ColorDialog::new()));
+    shape_color_btn.set_rgba(&gdk::RGBA::new(1.0, 0.0, 0.0, 1.0));
+    let stroke_adj = gtk4::Adjustment::new(2.0, 1.0, 100.0, 1.0, 5.0, 0.0);
+    let shape_stroke_spin = gtk4::SpinButton::new(Some(&stroke_adj), 1.0, 0);
+    shape_stroke_spin.set_tooltip_text(Some("Stroke width (px)"));
+    shape_stroke_spin.set_width_chars(4);
+    let stroke_label = gtk4::Label::new(Some("px"));
+    let shape_tool_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    shape_tool_bar.set_visible(false);
+    shape_tool_bar.set_margin_start(12); shape_tool_bar.set_margin_end(12);
+    shape_tool_bar.set_margin_top(6); shape_tool_bar.set_margin_bottom(6);
+    shape_tool_bar.append(&shape_done_btn);
+    shape_tool_bar.append(&shape_hint);
+    shape_tool_bar.append(&shape_color_btn);
+    shape_tool_bar.append(&shape_stroke_spin);
+    shape_tool_bar.append(&stroke_label);
+
     let save_menu = {
         let m = gio::Menu::new();
         let file_sec = gio::Menu::new();
@@ -169,11 +209,13 @@ pub fn build(app: &adw::Application) -> Widgets {
     header.pack_end(&save_btn);
     header.pack_end(&zoom_group);
     header.pack_end(&edit_group);
+    header.pack_end(&shapes_group);
 
     let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     content.append(&scrolled);
     content.append(&crop_bar);
     content.append(&text_tool_bar);
+    content.append(&shape_tool_bar);
     content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     content.append(&status_box);
 
@@ -197,5 +239,7 @@ pub fn build(app: &adw::Application) -> Widgets {
         edit_group, open_btn, undo_btn, zoom_out_btn, zoom_fit_btn, zoom_orig_btn, zoom_in_btn,
         resize_btn, rotate_ccw_btn, rotate_cw_btn, flip_h_btn, flip_v_btn,
         crop_btn, text_btn, save_btn,
+        rect_btn, line_btn, arrow_btn,
+        shape_tool_bar, shape_done_btn, shape_color_btn, shape_stroke_spin,
     }
 }
